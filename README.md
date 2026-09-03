@@ -9,7 +9,7 @@ Little-Snitch style indicator on the top bar: filled when recording, hollow when
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/itz4blitz/blitz.screenpipe.git --enable
+omarchy plugin add https://github.com/itz4blitz/blitz-screenpipe.git --enable
 ```
 
 1. Install the CLI from this repo (or keep your own):
