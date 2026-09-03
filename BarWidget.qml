@@ -25,32 +25,41 @@ Panel {
   property string agentNote: ""
   property string hint: ""
   property var orgs: []
+  property int hoveredBucket: -1
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color dimColor: bar && bar.dimForeground ? bar.dimForeground : Color.muted
-  readonly property color trackColor: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.22)
+  // Popup surface colors (not bar colors) — readable on the card
+  readonly property color foreground: Color.popups.text
+  readonly property color dimColor: Util.alpha(foreground, 0.62)
+  readonly property color faintColor: Util.alpha(foreground, 0.38)
+  readonly property color trackColor: Util.alpha(foreground, 0.12)
   readonly property color okColor: Color.accent
-  readonly property color warnColor: bar ? bar.urgent : Color.urgent
-  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+  readonly property color warnColor: Color.urgent
+  readonly property color surfaceLift: Util.alpha(foreground, 0.06)
+  readonly property string fontFamily: Style.font.family
   readonly property string collectorPath: {
     var url = String(Qt.resolvedUrl("screenpipe_collect.py"))
     return url.startsWith("file://") ? url.substring(7) : url
   }
 
-  readonly property string statusLine: {
-    if (!root.ready) return root.hint !== "" ? root.hint : "unavailable"
-    var parts = []
-    parts.push(root.paused ? "Paused" : (root.recording ? "Recording" : "Idle"))
-    parts.push(root.mode)
-    if (root.reason) parts.push(root.reason)
-    return parts.join(" · ")
+  readonly property string stateWord: {
+    if (!root.ready) return "Offline"
+    if (root.paused) return "Paused"
+    if (root.recording) return "Live"
+    return "Idle"
   }
 
-  readonly property string agentSummary: {
-    if (!root.ready) return ""
-    if (root.agentShare)
-      return root.agentLabel + (root.apiUrl ? " · " + root.apiUrl : "")
-    return "Local only · not shared with agents"
+  readonly property string heroMeta: {
+    if (!root.ready) return root.hint !== "" ? root.hint : "not configured"
+    var bits = [root.mode === "auto" ? "auto routing" : "pinned"]
+    if (root.reason) bits.push(root.reason.replace(/^focus:/, "").replace(/^app:/, ""))
+    return bits.join("  ·  ")
+  }
+
+  readonly property color stateColor: {
+    if (!root.ready) return root.warnColor
+    if (root.paused) return root.faintColor
+    if (root.recording) return root.okColor
+    return root.dimColor
   }
 
   function apply(payload) {
@@ -94,16 +103,8 @@ Panel {
     if (root.bar) root.bar.run("bash -lc 'xdg-open \"$HOME/.config/screenpipe/agent-targets.json\"'")
   }
 
-  function bucketShares(modelData) {
-    return (modelData.agent && modelData.agent.share)
-      || (modelData.hermes && modelData.hermes.share)
-      || modelData.agent_share === true
-  }
-
-  function bucketAgentLabel(modelData) {
-    if (modelData.agent && modelData.agent.label) return modelData.agent.label
-    if (modelData.hermes && modelData.hermes.label) return modelData.hermes.label
-    return "agent"
+  function bucketShares(m) {
+    return (m.agent && m.agent.share) || (m.hermes && m.hermes.share) || m.agent_share === true
   }
 
   function triggerPress(button) {
@@ -136,6 +137,7 @@ Panel {
     onTriggered: root.refresh()
   }
 
+  // ── bar chip ──────────────────────────────────────────────
   WidgetButton {
     id: button
     anchors.fill: parent
@@ -150,29 +152,32 @@ Panel {
     Row {
       id: chip
       anchors.centerIn: parent
-      spacing: Style.space(8)
+      spacing: Style.space(7)
 
-      // Live / idle indicator
       Rectangle {
-        width: Style.space(9)
+        width: Style.space(8)
         height: width
         radius: width / 2
-        color: root.recording ? root.okColor : "transparent"
+        color: root.recording ? Color.accent : "transparent"
         border.width: root.recording ? 0 : 1.5
-        border.color: root.ready ? root.dimColor : root.warnColor
+        border.color: root.ready
+          ? (bar && bar.dimForeground ? bar.dimForeground : Color.muted)
+          : Color.urgent
         anchors.verticalCenter: parent.verticalCenter
 
         SequentialAnimation on opacity {
           running: root.recording
           loops: Animation.Infinite
-          NumberAnimation { from: 1.0; to: 0.35; duration: 900 }
-          NumberAnimation { from: 0.35; to: 1.0; duration: 900 }
+          NumberAnimation { from: 1.0; to: 0.28; duration: 1000; easing.type: Easing.InOutSine }
+          NumberAnimation { from: 0.28; to: 1.0; duration: 1000; easing.type: Easing.InOutSine }
         }
       }
 
       Text {
         text: root.shortLabel
-        color: root.recording ? root.okColor : root.foreground
+        color: root.recording
+          ? Color.accent
+          : (bar ? bar.barForeground : Color.foreground)
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         font.bold: true
@@ -181,223 +186,416 @@ Panel {
     }
   }
 
+  // ── panel ─────────────────────────────────────────────────
   KeyboardPanel {
     id: panel
     anchorItem: button
     owner: root
     bar: root.bar
     open: root.opened || root.demoLock
-    contentWidth: panel.fittedContentWidth(Style.space(440))
-    contentHeight: panel.fittedContentHeight(Style.space(520), Style.space(600))
+    contentWidth: panel.fittedContentWidth(Style.space(380))
+    contentHeight: panel.fittedContentHeight(
+      Style.space(56)           // hero
+      + Style.space(16) + 1     // gap + hairline
+      + Style.space(16) + Style.space(34)  // gap + segment
+      + Style.space(16) + Style.space(18) + (root.orgs.length * Style.space(56))  // buckets
+      + Style.space(16) + Style.space(88)  // agent footer
+      + Style.space(24),
+      Style.space(720)
+    )
 
-    Item {
-      anchors.fill: parent
+    Column {
+      id: panelBody
+      width: parent.width
+      spacing: Style.space(16)
 
-      Column {
-        id: panelBody
-        anchors.fill: parent
-        spacing: Style.space(14)
+      // Hero: monogram + state + pause switch
+      Item {
+        width: parent.width
+        height: Style.space(56)
 
-        PanelHero {
-          width: parent.width
-          title: root.paused ? "Paused" : (root.ready ? root.label : "Screenpipe")
-          meta: root.statusLine
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-          trailingControl: Component {
-            Button {
-              text: root.paused ? "Resume" : "Pause"
-              foreground: root.foreground
-              onClicked: root.runAction(root.paused ? "resume" : "pause")
-            }
+        // Monogram disc
+        Rectangle {
+          id: mono
+          width: Style.space(48)
+          height: width
+          radius: width / 2
+          color: root.recording
+            ? Qt.rgba(root.okColor.r, root.okColor.g, root.okColor.b, 0.18)
+            : root.surfaceLift
+          border.width: 1
+          border.color: root.recording
+            ? Qt.rgba(root.okColor.r, root.okColor.g, root.okColor.b, 0.55)
+            : root.trackColor
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+
+          Text {
+            anchors.centerIn: parent
+            text: root.shortLabel
+            color: root.recording ? root.okColor : root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+            font.bold: true
           }
         }
 
-        // Compact action strip
-        Row {
-          width: parent.width
-          spacing: Style.space(8)
+        Column {
+          anchors.left: mono.right
+          anchors.leftMargin: Style.space(14)
+          anchors.right: pauseSwitch.left
+          anchors.rightMargin: Style.space(12)
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(3)
 
-          Button {
-            text: root.mode === "auto" ? "Auto ✓" : "Auto"
-            foreground: root.foreground
-            onClicked: root.runAction("clear")
-          }
-          Button {
-            text: "Routes"
-            foreground: root.foreground
-            onClicked: root.openRoutes()
-          }
-          Button {
-            text: "Agents"
-            foreground: root.foreground
-            onClicked: root.openAgentTargets()
-          }
-        }
-
-        Flickable {
-          id: orgList
-          width: parent.width
-          height: parent.height - y
-          clip: true
-          contentWidth: width
-          contentHeight: orgCol.implicitHeight
-          boundsBehavior: Flickable.StopAtBounds
-
-          Column {
-            id: orgCol
-            width: orgList.width
+          Row {
             spacing: Style.space(8)
+            width: parent.width
 
-            PanelSectionHeader {
-              text: "BUCKETS"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
+            Text {
+              text: root.ready ? root.label : "Screenpipe"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.title
+              font.bold: true
+              elide: Text.ElideRight
+              width: Math.min(implicitWidth, parent.width - statePill.width - Style.space(8))
             }
 
-            Repeater {
-              model: root.orgs
-              delegate: BorderSurface {
-                required property var modelData
-                width: orgCol.width
-                height: Style.space(78)
-                radius: Style.spacing.labelGap
-                color: modelData.selected
-                  ? Style.selectedFillFor(root.foreground, Color.accent)
-                  : "transparent"
-                borderSpec: Border.controlSpec(
-                  modelData.selected ? "selected" : "normal",
-                  root.foreground,
-                  Color.accent
-                )
+            Rectangle {
+              id: statePill
+              anchors.verticalCenter: parent.verticalCenter
+              width: stateTxt.implicitWidth + Style.space(12)
+              height: Style.space(20)
+              radius: height / 2
+              color: root.recording
+                ? Qt.rgba(root.okColor.r, root.okColor.g, root.okColor.b, 0.18)
+                : root.surfaceLift
 
-                Row {
-                  anchors.fill: parent
-                  anchors.margins: Style.space(14)
-                  spacing: Style.space(12)
+              Text {
+                id: stateTxt
+                anchors.centerIn: parent
+                text: root.stateWord
+                color: root.stateColor
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 0.6
+              }
+            }
+          }
 
-                  // Status pip
-                  Rectangle {
-                    width: Style.space(11)
-                    height: width
-                    radius: width / 2
-                    color: modelData.recording ? root.okColor : root.trackColor
-                    border.width: modelData.recording ? 0 : 1
-                    border.color: root.dimColor
-                    anchors.verticalCenter: parent.verticalCenter
+          Text {
+            width: parent.width
+            text: root.heroMeta
+            color: root.dimColor
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
+        }
 
-                    SequentialAnimation on opacity {
-                      running: modelData.recording === true
-                      loops: Animation.Infinite
-                      NumberAnimation { from: 1.0; to: 0.4; duration: 850 }
-                      NumberAnimation { from: 0.4; to: 1.0; duration: 850 }
-                    }
-                  }
+        ToggleSwitch {
+          id: pauseSwitch
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          checked: root.recording && !root.paused
+          foreground: root.foreground
+          accent: root.okColor
+          onToggled: root.runAction(root.recording && !root.paused ? "pause" : "resume")
+        }
+      }
 
-                  Column {
-                    width: parent.width - Style.space(90)
-                    anchors.verticalCenter: parent.verticalCenter
-                    spacing: Style.space(3)
+      // Hairline
+      Rectangle {
+        width: parent.width
+        height: 1
+        color: root.trackColor
+      }
 
-                    Text {
-                      text: modelData.label
-                      color: root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.body
-                      font.bold: true
-                      elide: Text.ElideRight
-                      width: parent.width
-                    }
+      // Mode segmented control
+      Item {
+        width: parent.width
+        height: Style.space(34)
 
-                    Text {
-                      width: parent.width
-                      text: ":" + modelData.port
-                        + (root.bucketShares(modelData)
-                          ? " · shares with " + root.bucketAgentLabel(modelData)
-                          : " · local only")
-                      color: root.dimColor
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                      elide: Text.ElideRight
-                    }
-                  }
-                }
+        Rectangle {
+          anchors.fill: parent
+          radius: Style.cornerRadius
+          color: root.surfaceLift
+        }
 
-                // REC / SELECTED pill
-                Rectangle {
-                  visible: modelData.recording || modelData.selected
-                  anchors.right: parent.right
-                  anchors.rightMargin: Style.space(14)
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: pillText.implicitWidth + Style.space(14)
-                  height: Style.space(22)
-                  radius: height / 2
-                  color: modelData.recording
-                    ? Qt.rgba(root.okColor.r, root.okColor.g, root.okColor.b, 0.22)
-                    : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.10)
+        Row {
+          anchors.fill: parent
+          anchors.margins: Style.space(3)
+          spacing: Style.space(2)
 
-                  Text {
-                    id: pillText
-                    anchors.centerIn: parent
-                    text: modelData.recording ? "REC" : "ON"
-                    color: modelData.recording ? root.okColor : root.dimColor
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    font.bold: true
-                  }
-                }
+          Repeater {
+            model: [
+              { id: "auto", label: "Auto" },
+              { id: "manual", label: "Pinned" }
+            ]
+            delegate: Item {
+              required property var modelData
+              width: (parent.width - Style.space(2)) / 2
+              height: parent.height
+              readonly property bool active: {
+                if (modelData.id === "auto") return root.mode === "auto"
+                return root.mode === "manual"
+              }
 
-                MouseArea {
-                  anchors.fill: parent
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: root.runAction(modelData.id)
+              Rectangle {
+                anchors.fill: parent
+                radius: Math.max(2, Style.cornerRadius - 2)
+                color: parent.active ? Util.alpha(root.foreground, 0.12) : "transparent"
+                border.width: parent.active ? 1 : 0
+                border.color: Util.alpha(root.foreground, 0.18)
+              }
+
+              Text {
+                anchors.centerIn: parent
+                text: modelData.label
+                color: parent.active ? root.foreground : root.dimColor
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: parent.active
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  if (modelData.id === "auto") root.runAction("clear")
+                  // Pinned is set by clicking a bucket; no-op if already manual
                 }
               }
             }
+          }
+        }
+      }
 
-            Item { width: 1; height: Style.space(4) }
+      // Buckets
+      Column {
+        width: parent.width
+        spacing: Style.space(4)
 
-            PanelSectionHeader {
-              text: "AGENT"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
+        Text {
+          text: "BUCKET"
+          color: root.faintColor
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+          font.letterSpacing: 1.4
+        }
+
+        Repeater {
+          model: root.orgs
+          delegate: Item {
+            id: row
+            required property var modelData
+            required property int index
+            width: parent.width
+            height: Style.space(52)
+            readonly property bool selected: modelData.selected === true
+            readonly property bool live: modelData.recording === true
+            readonly property bool hot: root.hoveredBucket === index
+
+            Rectangle {
+              anchors.fill: parent
+              radius: Style.cornerRadius
+              color: {
+                if (row.live) return Qt.rgba(root.okColor.r, root.okColor.g, root.okColor.b, 0.10)
+                if (row.selected) return Util.alpha(root.foreground, 0.08)
+                if (row.hot) return Util.alpha(root.foreground, 0.05)
+                return "transparent"
+              }
+              border.width: row.selected || row.live ? 1 : 0
+              border.color: row.live
+                ? Qt.rgba(root.okColor.r, root.okColor.g, root.okColor.b, 0.35)
+                : Util.alpha(root.foreground, 0.14)
+
+              Behavior on color { ColorAnimation { duration: 90 } }
             }
 
-            BorderSurface {
-              width: parent.width
-              height: agentCol.implicitHeight + Style.space(28)
-              radius: Style.spacing.labelGap
-              color: Qt.rgba(0, 0, 0, 0.22)
-              borderSpec: Border.none()
+            // Left accent bar when live/selected
+            Rectangle {
+              visible: row.selected || row.live
+              width: Style.space(3)
+              height: parent.height - Style.space(14)
+              radius: width / 2
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(6)
+              anchors.verticalCenter: parent.verticalCenter
+              color: row.live ? root.okColor : root.faintColor
+            }
+
+            Row {
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(18)
+              anchors.rightMargin: Style.space(14)
+              spacing: Style.space(12)
+
+              // Initials disc
+              Rectangle {
+                width: Style.space(28)
+                height: width
+                radius: width / 2
+                anchors.verticalCenter: parent.verticalCenter
+                color: row.live
+                  ? Qt.rgba(root.okColor.r, root.okColor.g, root.okColor.b, 0.20)
+                  : root.surfaceLift
+
+                Text {
+                  anchors.centerIn: parent
+                  text: String(modelData.short || modelData.label || "?").slice(0, 2)
+                  color: row.live ? root.okColor : root.dimColor
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+              }
 
               Column {
-                id: agentCol
-                anchors.left: parent.left
-                anchors.right: parent.right
+                width: parent.width - Style.space(28) - Style.space(12) - Style.space(36)
                 anchors.verticalCenter: parent.verticalCenter
-                anchors.margins: Style.space(14)
-                spacing: Style.space(4)
+                spacing: Style.space(2)
 
                 Text {
                   width: parent.width
-                  wrapMode: Text.WordWrap
-                  text: root.agentSummary
+                  text: modelData.label
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
                   font.bold: true
+                  elide: Text.ElideRight
                 }
 
                 Text {
                   width: parent.width
-                  wrapMode: Text.WordWrap
-                  text: root.agentNote !== ""
-                    ? root.agentNote
-                    : "Middle/right-click chip to pause. Click a bucket to pin. Auto clears the pin."
+                  text: root.bucketShares(modelData) ? "shares with agent" : "stays on this machine"
                   color: root.dimColor
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
                 }
+              }
+
+              // Radio / live mark
+              Item {
+                width: Style.space(18)
+                height: width
+                anchors.verticalCenter: parent.verticalCenter
+
+                Rectangle {
+                  anchors.fill: parent
+                  radius: width / 2
+                  color: "transparent"
+                  border.width: 1.5
+                  border.color: row.live || row.selected ? root.okColor : root.faintColor
+
+                  Rectangle {
+                    visible: row.selected || row.live
+                    anchors.centerIn: parent
+                    width: parent.width * 0.45
+                    height: width
+                    radius: width / 2
+                    color: row.live ? root.okColor : root.foreground
+                  }
+                }
+              }
+            }
+
+            MouseArea {
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onEntered: root.hoveredBucket = index
+              onExited: if (root.hoveredBucket === index) root.hoveredBucket = -1
+              onClicked: root.runAction(modelData.id)
+            }
+          }
+        }
+      }
+
+      // Agent footer
+      Rectangle {
+        width: parent.width
+        height: agentInner.implicitHeight + Style.space(20)
+        radius: Style.cornerRadius
+        color: root.surfaceLift
+
+        Column {
+          id: agentInner
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          anchors.margins: Style.space(12)
+          spacing: Style.space(4)
+
+          Row {
+            width: parent.width
+            spacing: Style.space(8)
+
+            Text {
+              text: "AGENT"
+              color: root.faintColor
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.letterSpacing: 1.4
+              anchors.verticalCenter: parent.verticalCenter
+            }
+
+            Item { width: 1; height: 1 }
+
+            Text {
+              visible: root.ready
+              text: root.agentShare ? "opt-in" : "off"
+              color: root.agentShare ? root.okColor : root.faintColor
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              anchors.verticalCenter: parent.verticalCenter
+            }
+          }
+
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: root.agentShare
+              ? (root.agentLabel || "Agent") + (root.apiUrl ? "  ·  " + root.apiUrl : "")
+              : (root.agentNote || "This bucket never leaves the machine.")
+            color: root.dimColor
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Row {
+            spacing: Style.space(14)
+            topPadding: Style.space(4)
+
+            Text {
+              text: "Routes"
+              color: root.okColor
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.openRoutes()
+              }
+            }
+
+            Text {
+              text: "Agent map"
+              color: root.okColor
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.openAgentTargets()
               }
             }
           }
