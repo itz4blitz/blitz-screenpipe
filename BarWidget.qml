@@ -344,61 +344,92 @@ Panel {
         color: root.trackColor
       }
 
-      // Mode segmented control
-      Item {
+      // Mode control — Auto follows window routes; Pinned locks current bucket
+      Row {
         width: parent.width
-        height: Style.space(34)
+        height: Style.space(36)
+        spacing: Style.space(6)
 
+        // Auto
         Rectangle {
-          anchors.fill: parent
+          width: (parent.width - parent.spacing) / 2
+          height: parent.height
           radius: Style.cornerRadius
-          color: root.surfaceLift
+          color: root.mode === "auto"
+            ? Util.alpha(root.okColor, 0.16)
+            : root.surfaceLift
+          border.width: 1
+          border.color: root.mode === "auto"
+            ? Util.alpha(root.okColor, 0.45)
+            : root.trackColor
+
+          Column {
+            anchors.centerIn: parent
+            spacing: Style.space(1)
+            Text {
+              anchors.horizontalCenter: parent.horizontalCenter
+              text: "Auto"
+              color: root.mode === "auto" ? root.okColor : root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+            }
+            Text {
+              anchors.horizontalCenter: parent.horizontalCenter
+              text: "follow apps"
+              color: root.dimColor
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.runAction("clear")
+          }
         }
 
-        Row {
-          anchors.fill: parent
-          anchors.margins: Style.space(3)
-          spacing: Style.space(2)
+        // Pinned
+        Rectangle {
+          width: (parent.width - parent.spacing) / 2
+          height: parent.height
+          radius: Style.cornerRadius
+          color: root.mode === "manual"
+            ? Util.alpha(root.foreground, 0.12)
+            : root.surfaceLift
+          border.width: 1
+          border.color: root.mode === "manual"
+            ? Util.alpha(root.foreground, 0.28)
+            : root.trackColor
 
-          Repeater {
-            model: [
-              { id: "auto", label: "Auto" },
-              { id: "manual", label: "Pinned" }
-            ]
-            delegate: Item {
-              required property var modelData
-              width: (parent.width - Style.space(2)) / 2
-              height: parent.height
-              readonly property bool active: {
-                if (modelData.id === "auto") return root.mode === "auto"
-                return root.mode === "manual"
-              }
+          Column {
+            anchors.centerIn: parent
+            spacing: Style.space(1)
+            Text {
+              anchors.horizontalCenter: parent.horizontalCenter
+              text: "Pinned"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+            }
+            Text {
+              anchors.horizontalCenter: parent.horizontalCenter
+              text: root.mode === "manual" ? ("hold " + root.shortLabel) : "lock current"
+              color: root.dimColor
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
 
-              Rectangle {
-                anchors.fill: parent
-                radius: Math.max(2, Style.cornerRadius - 2)
-                color: parent.active ? Util.alpha(root.foreground, 0.12) : "transparent"
-                border.width: parent.active ? 1 : 0
-                border.color: Util.alpha(root.foreground, 0.18)
-              }
-
-              Text {
-                anchors.centerIn: parent
-                text: modelData.label
-                color: parent.active ? root.foreground : root.dimColor
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.bold: parent.active
-              }
-
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  if (modelData.id === "auto") root.runAction("clear")
-                  // Pinned is set by clicking a bucket; no-op if already manual
-                }
-              }
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: {
+              // Pin whatever is showing now (active / desired bucket)
+              if (root.org && root.org.length)
+                root.runAction(root.org)
             }
           }
         }
@@ -526,12 +557,29 @@ Panel {
               }
 
               // Folder button — change storage path
-              PanelActionButton {
+              Rectangle {
+                width: Style.space(34)
+                height: Style.space(28)
+                radius: Style.cornerRadius
                 anchors.verticalCenter: parent.verticalCenter
-                iconText: "󰉋"
-                tooltipText: "Change recording folder"
-                foreground: root.foreground
-                onClicked: root.pickDir(modelData.id)
+                color: root.surfaceLift
+                border.width: 1
+                border.color: root.trackColor
+
+                Text {
+                  anchors.centerIn: parent
+                  text: "Dir"
+                  color: root.dimColor
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.pickDir(modelData.id)
+                }
               }
 
               // Radio / live mark
@@ -559,9 +607,9 @@ Panel {
               }
             }
 
-            MouseArea {
+              MouseArea {
               anchors.fill: parent
-              anchors.rightMargin: Style.space(56)
+              anchors.rightMargin: Style.space(48)
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
               onEntered: root.hoveredBucket = index
