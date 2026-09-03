@@ -13,8 +13,9 @@ Panel {
   property bool ready: false
   property bool paused: true
   property bool recording: false
+  property bool demoLock: false
   property string mode: "auto"
-  property string org: "personal"
+  property string org: ""
   property string label: "Screenpipe"
   property string shortLabel: "?"
   property string reason: ""
@@ -36,14 +37,20 @@ Panel {
     return url.startsWith("file://") ? url.substring(7) : url
   }
 
-  // Mic glyphs (Nerd Font / Material-ish private use used elsewhere on this bar)
-  readonly property string micOn: "\uF130"
-  readonly property string micOff: "\uF131"
+  readonly property string statusLine: {
+    if (!root.ready) return root.hint !== "" ? root.hint : "unavailable"
+    var parts = []
+    parts.push(root.paused ? "Paused" : (root.recording ? "Recording" : "Idle"))
+    parts.push(root.mode)
+    if (root.reason) parts.push(root.reason)
+    return parts.join(" · ")
+  }
 
-  readonly property color micColor: {
-    if (!root.ready) return root.warnColor
-    if (root.paused || !root.recording) return root.trackColor
-    return root.okColor
+  readonly property string agentSummary: {
+    if (!root.ready) return ""
+    if (root.agentShare)
+      return root.agentLabel + (root.apiUrl ? " · " + root.apiUrl : "")
+    return "Local only · not shared with agents"
   }
 
   function apply(payload) {
@@ -52,7 +59,7 @@ Panel {
     paused = d.paused === true
     recording = d.recording === true
     mode = String(d.mode || "auto")
-    org = String(d.org || "personal")
+    org = String(d.org || "")
     label = String(d.label || "Screenpipe")
     shortLabel = String(d.short || "?")
     reason = String(d.reason || "")
@@ -63,6 +70,10 @@ Panel {
     agentNote = String(h.note || "")
     hint = String(d.hint || "")
     orgs = Array.isArray(d.orgs) ? d.orgs : []
+    if (d.demo) {
+      demoLock = true
+      if (!root.opened) root.open()
+    }
   }
 
   function refresh() {
@@ -83,12 +94,20 @@ Panel {
     if (root.bar) root.bar.run("bash -lc 'xdg-open \"$HOME/.config/screenpipe/agent-targets.json\"'")
   }
 
+  function bucketShares(modelData) {
+    return (modelData.agent && modelData.agent.share)
+      || (modelData.hermes && modelData.hermes.share)
+      || modelData.agent_share === true
+  }
+
+  function bucketAgentLabel(modelData) {
+    if (modelData.agent && modelData.agent.label) return modelData.agent.label
+    if (modelData.hermes && modelData.hermes.label) return modelData.hermes.label
+    return "agent"
+  }
+
   function triggerPress(button) {
-    if (button === Qt.MiddleButton) {
-      root.runAction(root.paused ? "resume" : "pause")
-      return
-    }
-    if (button === Qt.RightButton) {
+    if (button === Qt.MiddleButton || button === Qt.RightButton) {
       root.runAction(root.paused ? "resume" : "pause")
       return
     }
@@ -133,9 +152,9 @@ Panel {
       anchors.centerIn: parent
       spacing: Style.space(8)
 
-      // Little-Snitch style: filled when recording, hollow/dim when paused
+      // Live / idle indicator
       Rectangle {
-        width: Style.space(10)
+        width: Style.space(9)
         height: width
         radius: width / 2
         color: root.recording ? root.okColor : "transparent"
@@ -143,23 +162,12 @@ Panel {
         border.color: root.ready ? root.dimColor : root.warnColor
         anchors.verticalCenter: parent.verticalCenter
 
-        Rectangle {
-          visible: root.recording
-          anchors.centerIn: parent
-          width: parent.width * 0.45
-          height: width
-          radius: width / 2
-          color: root.foreground
-          opacity: 0.9
+        SequentialAnimation on opacity {
+          running: root.recording
+          loops: Animation.Infinite
+          NumberAnimation { from: 1.0; to: 0.35; duration: 900 }
+          NumberAnimation { from: 0.35; to: 1.0; duration: 900 }
         }
-      }
-
-      Text {
-        text: root.recording ? root.micOn : root.micOff
-        color: root.micColor
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.body
-        anchors.verticalCenter: parent.verticalCenter
       }
 
       Text {
@@ -178,9 +186,9 @@ Panel {
     anchorItem: button
     owner: root
     bar: root.bar
-    open: root.opened
-    contentWidth: panel.fittedContentWidth(Style.space(420))
-    contentHeight: panel.fittedContentHeight(Style.space(480), Style.space(560))
+    open: root.opened || root.demoLock
+    contentWidth: panel.fittedContentWidth(Style.space(440))
+    contentHeight: panel.fittedContentHeight(Style.space(520), Style.space(600))
 
     Item {
       anchors.fill: parent
@@ -188,16 +196,12 @@ Panel {
       Column {
         id: panelBody
         anchors.fill: parent
-        spacing: Style.space(12)
+        spacing: Style.space(14)
 
         PanelHero {
           width: parent.width
-          title: root.paused ? "Screenpipe paused" : root.label
-          meta: root.ready
-            ? ((root.recording ? "Recording" : "Idle")
-              + " · " + root.mode
-              + (root.reason ? " · " + root.reason : ""))
-            : (root.hint !== "" ? root.hint : "unavailable")
+          title: root.paused ? "Paused" : (root.ready ? root.label : "Screenpipe")
+          meta: root.statusLine
           foreground: root.foreground
           fontFamily: root.fontFamily
           trailingControl: Component {
@@ -209,14 +213,14 @@ Panel {
           }
         }
 
+        // Compact action strip
         Row {
           width: parent.width
           spacing: Style.space(8)
 
           Button {
-            text: "Auto"
+            text: root.mode === "auto" ? "Auto ✓" : "Auto"
             foreground: root.foreground
-            enabled: root.mode !== "auto" || root.org !== ""
             onClicked: root.runAction("clear")
           }
           Button {
@@ -225,7 +229,7 @@ Panel {
             onClicked: root.openRoutes()
           }
           Button {
-            text: "Agent map"
+            text: "Agents"
             foreground: root.foreground
             onClicked: root.openAgentTargets()
           }
@@ -243,10 +247,10 @@ Panel {
           Column {
             id: orgCol
             width: orgList.width
-            spacing: Style.space(6)
+            spacing: Style.space(8)
 
             PanelSectionHeader {
-              text: "ORG BUCKET"
+              text: "BUCKETS"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
@@ -256,67 +260,90 @@ Panel {
               delegate: BorderSurface {
                 required property var modelData
                 width: orgCol.width
-                height: rowInner.implicitHeight + Style.space(14)
+                height: Style.space(78)
                 radius: Style.spacing.labelGap
                 color: modelData.selected
                   ? Style.selectedFillFor(root.foreground, Color.accent)
                   : "transparent"
-                borderSpec: modelData.selected
-                  ? Border.controlSpec("normal", root.foreground, Color.accent)
-                  : Border.none()
+                borderSpec: Border.controlSpec(
+                  modelData.selected ? "selected" : "normal",
+                  root.foreground,
+                  Color.accent
+                )
 
-                Column {
-                  id: rowInner
-                  anchors.left: parent.left
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  anchors.margins: Style.space(10)
-                  spacing: Style.space(2)
+                Row {
+                  anchors.fill: parent
+                  anchors.margins: Style.space(14)
+                  spacing: Style.space(12)
 
-                  Row {
-                    width: parent.width
-                    spacing: Style.space(8)
+                  // Status pip
+                  Rectangle {
+                    width: Style.space(11)
+                    height: width
+                    radius: width / 2
+                    color: modelData.recording ? root.okColor : root.trackColor
+                    border.width: modelData.recording ? 0 : 1
+                    border.color: root.dimColor
+                    anchors.verticalCenter: parent.verticalCenter
 
-                    Rectangle {
-                      width: Style.space(8)
-                      height: width
-                      radius: width / 2
-                      color: modelData.recording ? root.okColor : root.trackColor
-                      anchors.verticalCenter: parent.verticalCenter
+                    SequentialAnimation on opacity {
+                      running: modelData.recording === true
+                      loops: Animation.Infinite
+                      NumberAnimation { from: 1.0; to: 0.4; duration: 850 }
+                      NumberAnimation { from: 0.4; to: 1.0; duration: 850 }
                     }
+                  }
+
+                  Column {
+                    width: parent.width - Style.space(90)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(3)
 
                     Text {
                       text: modelData.label
                       color: root.foreground
                       font.family: root.fontFamily
-                      font.pixelSize: Style.font.bodySmall
+                      font.pixelSize: Style.font.body
                       font.bold: true
-                      anchors.verticalCenter: parent.verticalCenter
-                    }
-
-                    Item {
-                      width: Math.max(1, parent.width - 160)
-                      height: 1
+                      elide: Text.ElideRight
+                      width: parent.width
                     }
 
                     Text {
-                      text: modelData.recording ? "REC" : (modelData.selected ? "selected" : "")
-                      color: modelData.recording ? root.okColor : root.dimColor
+                      width: parent.width
+                      text: ":" + modelData.port
+                        + (root.bucketShares(modelData)
+                          ? " · shares with " + root.bucketAgentLabel(modelData)
+                          : " · local only")
+                      color: root.dimColor
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
-                      anchors.verticalCenter: parent.verticalCenter
+                      elide: Text.ElideRight
                     }
                   }
+                }
+
+                // REC / SELECTED pill
+                Rectangle {
+                  visible: modelData.recording || modelData.selected
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(14)
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: pillText.implicitWidth + Style.space(14)
+                  height: Style.space(22)
+                  radius: height / 2
+                  color: modelData.recording
+                    ? Qt.rgba(root.okColor.r, root.okColor.g, root.okColor.b, 0.22)
+                    : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.10)
 
                   Text {
-                    width: parent.width
-                    text: ":" + modelData.port
-                      + ((modelData.agent && modelData.agent.share) || (modelData.hermes && modelData.hermes.share)
-                        ? " · Agent: " + ((modelData.agent && modelData.agent.label) || (modelData.hermes && modelData.hermes.label) || "yes")
-                        : " · local only")
-                    color: root.dimColor
+                    id: pillText
+                    anchors.centerIn: parent
+                    text: modelData.recording ? "REC" : "ON"
+                    color: modelData.recording ? root.okColor : root.dimColor
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
+                    font.bold: true
                   }
                 }
 
@@ -328,30 +355,50 @@ Panel {
               }
             }
 
+            Item { width: 1; height: Style.space(4) }
+
             PanelSectionHeader {
               text: "AGENT"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
 
-            Text {
+            BorderSurface {
               width: parent.width
-              wrapMode: Text.WordWrap
-              text: root.agentShare
-                ? (root.agentLabel + "\n" + root.apiUrl + "\n" + root.agentNote)
-                : ("Not shared for " + root.label + ".\n" + (root.agentNote || "Personal stays on this machine."))
-              color: root.dimColor
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
+              height: agentCol.implicitHeight + Style.space(28)
+              radius: Style.spacing.labelGap
+              color: Qt.rgba(0, 0, 0, 0.22)
+              borderSpec: Border.none()
 
-            Text {
-              width: parent.width
-              wrapMode: Text.WordWrap
-              text: "Middle/right-click chip to pause. Click an org to pin it (manual). Auto clears the pin."
-              color: root.dimColor
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
+              Column {
+                id: agentCol
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.margins: Style.space(14)
+                spacing: Style.space(4)
+
+                Text {
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                  text: root.agentSummary
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                }
+
+                Text {
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                  text: root.agentNote !== ""
+                    ? root.agentNote
+                    : "Middle/right-click chip to pause. Click a bucket to pin. Auto clears the pin."
+                  color: root.dimColor
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
             }
           }
         }

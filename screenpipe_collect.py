@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""blitz.screenpipe collector — thin wrapper around sp-org (config-driven)."""
+"""blitz.screenpipe collector — thin wrapper around sp-org (config-driven).
+
+Touch a DEMO file in this directory to force placeholder payload for README shots:
+  echo > DEMO          # default recording view
+  echo paused > DEMO   # paused view
+"""
 from __future__ import annotations
 
 import json
@@ -7,6 +12,8 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
 
 
 def sp(*args: str) -> subprocess.CompletedProcess[str]:
@@ -22,7 +29,99 @@ def sp(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def demo_view() -> str:
+    flag = HERE / "DEMO"
+    try:
+        if flag.is_file():
+            return flag.read_text(encoding="utf-8").strip() or "default"
+    except OSError:
+        pass
+    return ""
+
+
+def demo_payload(view: str = "default") -> dict:
+    """Placeholder-only names. Safe for public screenshots."""
+    paused = view in ("paused", "idle")
+    recording = not paused
+    active = "client" if recording else "personal"
+    orgs = [
+        {
+            "id": "work",
+            "label": "Work",
+            "short": "Wrk",
+            "port": 3030,
+            "selected": active == "work",
+            "recording": False,
+            "unit_active": False,
+            "health": False,
+            "agent_share": False,
+            "agent": {"share": False, "label": "Work agent", "note": "Local only."},
+            "hermes": {"share": False},
+        },
+        {
+            "id": "client",
+            "label": "Client",
+            "short": "Cli",
+            "port": 3031,
+            "selected": active == "client",
+            "recording": recording and active == "client",
+            "unit_active": recording and active == "client",
+            "health": recording and active == "client",
+            "agent_share": True,
+            "agent": {
+                "share": True,
+                "label": "Client agent",
+                "api_url": "http://127.0.0.1:3031",
+                "note": "Opt-in summaries when you ask.",
+            },
+            "hermes": {"share": True, "label": "Client agent"},
+        },
+        {
+            "id": "personal",
+            "label": "Personal",
+            "short": "Me",
+            "port": 3032,
+            "selected": active == "personal",
+            "recording": False,
+            "unit_active": paused,
+            "health": paused,
+            "agent_share": False,
+            "agent": {"share": False, "label": "Personal", "note": "Never shared."},
+            "hermes": {"share": False},
+        },
+    ]
+    active_org = next(o for o in orgs if o["id"] == active)
+    agent = active_org["agent"]
+    return {
+        "ready": True,
+        "demo": True,
+        "demoView": view,
+        "paused": paused,
+        "recording": recording,
+        "mode": "auto",
+        "org": active,
+        "desired": active,
+        "detected": active,
+        "reason": "focus:app:Slack" if recording else "default",
+        "label": active_org["label"],
+        "short": active_org["short"],
+        "port": active_org["port"],
+        "api_url": agent.get("api_url") or f"http://127.0.0.1:{active_org['port']}",
+        "agent_share": bool(agent.get("share")),
+        "hermes_share": bool(agent.get("share")),
+        "agent": agent,
+        "hermes": agent,
+        "override": None,
+        "orgs": orgs,
+        "hint": "",
+    }
+
+
 def status_json() -> dict:
+    view = demo_view()
+    if view:
+        return demo_payload(view)
+
     r = sp("status", "--json")
     if r.returncode != 0 or not r.stdout.strip():
         return {
@@ -50,6 +149,10 @@ def main(argv: list[str]) -> int:
 
     action = argv[1]
     if action == "action":
+        if demo_view():
+            # In DEMO mode, ignore mutations and re-emit demo payload
+            print(json.dumps(demo_payload(demo_view())))
+            return 0
         if len(argv) < 3:
             print(json.dumps({"ok": False, "error": "missing action"}))
             return 1
@@ -63,81 +166,7 @@ def main(argv: list[str]) -> int:
         return 0 if r.returncode == 0 else 1
 
     if action == "demo":
-        # Placeholder-only payload for screenshots. No real org names.
-        print(
-            json.dumps(
-                {
-                    "ready": True,
-                    "paused": False,
-                    "recording": True,
-                    "mode": "auto",
-                    "org": "client",
-                    "desired": "client",
-                    "detected": "client",
-                    "reason": "focus:slack:client",
-                    "label": "Client",
-                    "short": "Cli",
-                    "port": 3031,
-                    "api_url": "http://127.0.0.1:3031",
-                    "agent_share": True,
-                    "hermes_share": True,
-                    "agent": {
-                        "label": "Client agent",
-                        "api_url": "http://127.0.0.1:3031",
-                        "note": "Shares summaries only when you ask.",
-                        "share": True,
-                    },
-                    "hermes": {
-                        "label": "Client agent",
-                        "api_url": "http://127.0.0.1:3031",
-                        "note": "Shares summaries only when you ask.",
-                        "share": True,
-                    },
-                    "override": None,
-                    "orgs": [
-                        {
-                            "id": "work",
-                            "label": "Work",
-                            "short": "Wrk",
-                            "port": 3030,
-                            "selected": False,
-                            "recording": False,
-                            "unit_active": False,
-                            "health": False,
-                            "agent_share": False,
-                            "agent": {"share": False},
-                            "hermes": {"share": False},
-                        },
-                        {
-                            "id": "client",
-                            "label": "Client",
-                            "short": "Cli",
-                            "port": 3031,
-                            "selected": True,
-                            "recording": True,
-                            "unit_active": True,
-                            "health": True,
-                            "agent_share": True,
-                            "agent": {"share": True, "label": "Client agent"},
-                            "hermes": {"share": True, "label": "Client agent"},
-                        },
-                        {
-                            "id": "personal",
-                            "label": "Personal",
-                            "short": "Me",
-                            "port": 3032,
-                            "selected": False,
-                            "recording": False,
-                            "unit_active": False,
-                            "health": False,
-                            "agent_share": False,
-                            "agent": {"share": False},
-                            "hermes": {"share": False},
-                        },
-                    ],
-                }
-            )
-        )
+        print(json.dumps(demo_payload(argv[2] if len(argv) > 2 else "default")))
         return 0
 
     print(json.dumps(status_json()))

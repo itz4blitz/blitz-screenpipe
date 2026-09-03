@@ -53,7 +53,23 @@ sp-org agent             # print agent share target for active bucket
 sp-org write-units
 ```
 
+## Screenshots (fake data)
+
+Same pattern as the other `blitz.*` chips — touch a local `DEMO` file (gitignored):
+
+```bash
+cd ~/.config/omarchy/plugins/blitz.screenpipe
+echo default > DEMO    # recording Client bucket
+# echo paused > DEMO   # paused Personal view
+omarchy-shell shell rescanPlugins
+# open the chip, shoot, then:
+rm DEMO
+```
+
+Demo payload uses placeholder buckets only (`Work` / `Client` / `Personal`). Your real `orgs.toml` is never read while `DEMO` exists.
+
 ## Privacy
 
 - Do not commit `~/.config/screenpipe/orgs.toml`, `org-routes.toml`, or `agent-targets.json`.
 - Examples in `examples/` use placeholder names only (`work`, `client`, `personal`).
+- Never commit a screenshot taken without `DEMO` if your live labels are personal.
