@@ -1,84 +1,42 @@
 # blitz.screenpipe
 
-Omarchy bar chip for multi-bucket [Screenpipe](https://github.com/screenpipe/screenpipe) recording.
+Omarchy bar chip for [Screenpipe](https://github.com/screenpipe/screenpipe) with an **inbox → file later** workflow.
 
-Little-Snitch style indicator on the top bar: filled when recording, hollow when paused. Click to switch buckets, pause, or inspect the agent target for the active bucket.
-
-**This plugin ships with zero personal configuration.** Bucket names, window-routing rules, and agent URLs live only under each user's `~/.config/screenpipe/`.
+One local recorder writes to an inbox folder. When a call starts, the chip opens and tells you. **Nothing is copied into a labeled destination until you file the meeting.** Optional route hints can suggest a destination; they never auto-file.
 
 ## Install
 
 ```bash
 omarchy plugin add https://github.com/itz4blitz/blitz-screenpipe.git --enable
-```
-
-1. Install the CLI from this repo (or keep your own):
-
-```bash
 install -m 755 sp-org ~/.local/bin/sp-org
-```
-
-2. Copy examples and edit them for your buckets:
-
-```bash
 mkdir -p ~/.config/screenpipe
 cp examples/orgs.example.toml ~/.config/screenpipe/orgs.toml
-cp examples/org-routes.example.toml ~/.config/screenpipe/org-routes.toml
-cp examples/agent-targets.example.json ~/.config/screenpipe/agent-targets.json
-$EDITOR ~/.config/screenpipe/orgs.toml
+# edit destinations — keep [inbox] as the only live recorder
+sp-org ensure
 ```
 
-3. Generate systemd user units and start the auto-router:
+## Flow
+
+1. Inbox recorder always on (or pause from the chip).
+2. Call detected → bar pops open: “recording to inbox”.
+3. Call ends → meeting appears under **Unfiled**.
+4. Click a destination → exports that meeting into that folder only then.
 
 ```bash
-sp-org write-units
-# optional: systemd user service that runs `sp-org watch`
-sp-org clear   # pick bucket from your routes
-```
-
-4. Put the chip on the bar (hot-reloads `shell.json`):
-
-```json
-{ "id": "blitz.screenpipe" }
-```
-
-## Storage
-
-Each bucket has its own on-disk folder (`data_dir` in `orgs.toml`). The bar shows path + size. Click the folder icon to retarget a bucket; if that bucket is live, the recorder restarts into the new folder.
-
-```bash
-sp-org set-dir work /mnt/storage/screenpipe/work
+sp-org status
+sp-org file 41 work
 sp-org pick-dir client
-```
-
-## CLI
-
-```text
-sp-org status [--json]
-sp-org <org-id>          # pin bucket (manual)
-sp-org clear             # back to auto routing
-sp-org pause | resume
-sp-org agent             # print agent share target for active bucket
-sp-org write-units
 ```
 
 ## Screenshots (fake data)
 
-Same pattern as the other `blitz.*` chips — touch a local `DEMO` file (gitignored):
-
 ```bash
-cd ~/.config/omarchy/plugins/blitz.screenpipe
-echo default > DEMO    # recording Client bucket
-# echo paused > DEMO   # paused Personal view
+echo default > DEMO    # in-call view
+# echo pending > DEMO  # unfiled list
 omarchy-shell shell rescanPlugins
-# open the chip, shoot, then:
 rm DEMO
 ```
 
-Demo payload uses placeholder buckets only (`Work` / `Client` / `Personal`). Your real `orgs.toml` is never read while `DEMO` exists.
-
 ## Privacy
 
-- Do not commit `~/.config/screenpipe/orgs.toml`, `org-routes.toml`, or `agent-targets.json`.
-- Examples in `examples/` use placeholder names only (`work`, `client`, `personal`).
-- Never commit a screenshot taken without `DEMO` if your live labels are personal.
+Ship no personal `orgs.toml` / routes / filings. Examples use `work` / `client` / `personal` only.

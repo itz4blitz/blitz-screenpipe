@@ -1,26 +1,27 @@
-# Example org buckets. Copy to ~/.config/screenpipe/orgs.toml and edit.
-# Use whatever ids/labels fit you. Nothing here is required.
+# Copy to ~/.config/screenpipe/orgs.toml
+# [inbox] is the only live recorder. [orgs.*] are file-later destinations.
+
+[inbox]
+label = "Inbox"
+short = "In"
+port = 3030
+data_dir = "~/.local/share/screenpipe/inbox"
+unit = "screenpipe-inbox.service"
 
 [orgs.work]
 label = "Work"
 short = "Wrk"
-port = 3030
 data_dir = "~/.local/share/screenpipe/work"
-unit = "screenpipe-work.service"
 agent_share = false
 
 [orgs.client]
 label = "Client"
 short = "Cli"
-port = 3031
 data_dir = "~/.local/share/screenpipe/client"
-unit = "screenpipe-client.service"
 agent_share = true
 
 [orgs.personal]
 label = "Personal"
 short = "Me"
-port = 3032
 data_dir = "~/.local/share/screenpipe/personal"
-unit = "screenpipe-personal.service"
 agent_share = false

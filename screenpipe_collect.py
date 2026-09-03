@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""blitz.screenpipe collector — thin wrapper around sp-org (config-driven).
-
-Touch a DEMO file in this directory to force placeholder payload for README shots:
-  echo > DEMO          # default recording view
-  echo paused > DEMO   # paused view
-"""
+"""blitz.screenpipe collector — inbox + file-later wrapper around sp-org."""
 from __future__ import annotations
 
 import json
@@ -17,16 +12,8 @@ HERE = Path(__file__).resolve().parent
 
 
 def sp(*args: str) -> subprocess.CompletedProcess[str]:
-    bin_path = shutil.which("sp-org")
-    if not bin_path:
-        local = Path.home() / ".local/bin/sp-org"
-        bin_path = str(local) if local.exists() else "sp-org"
-    return subprocess.run(
-        [bin_path, *args],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    bin_path = shutil.which("sp-org") or str(Path.home() / ".local/bin/sp-org")
+    return subprocess.run([bin_path, *args], text=True, capture_output=True, check=False)
 
 
 def demo_view() -> str:
@@ -40,124 +27,94 @@ def demo_view() -> str:
 
 
 def demo_payload(view: str = "default") -> dict:
-    """Placeholder-only names. Safe for public screenshots."""
-    paused = view in ("paused", "idle")
-    recording = not paused
-    active = "client" if recording else "personal"
-    orgs = [
-        {
-            "id": "work",
-            "label": "Work",
-            "short": "Wrk",
-            "port": 3030,
-            "dir": "/home/user/.local/share/screenpipe/work",
-            "dir_short": "~/.local/share/screenpipe/work",
-            "exists": True,
-            "size_bytes": 1288490188,
-            "size_human": "1.2G",
-            "selected": active == "work",
-            "recording": False,
-            "unit_active": False,
-            "health": False,
-            "agent_share": False,
-            "agent": {"share": False, "label": "Work agent", "note": "Local only."},
-            "hermes": {"share": False},
-        },
-        {
-            "id": "client",
-            "label": "Client",
-            "short": "Cli",
-            "port": 3031,
-            "dir": "/mnt/storage/screenpipe/client",
-            "dir_short": "/mnt/storage/screenpipe/client",
-            "exists": True,
-            "size_bytes": 482344960,
-            "size_human": "460M",
-            "selected": active == "client",
-            "recording": recording and active == "client",
-            "unit_active": recording and active == "client",
-            "health": recording and active == "client",
-            "agent_share": True,
-            "agent": {
-                "share": True,
-                "label": "Client agent",
-                "api_url": "http://127.0.0.1:3031",
-                "note": "Opt-in summaries when you ask.",
-            },
-            "hermes": {"share": True, "label": "Client agent"},
-        },
-        {
-            "id": "personal",
-            "label": "Personal",
-            "short": "Me",
-            "port": 3032,
-            "dir": "/home/user/.local/share/screenpipe/personal",
-            "dir_short": "~/.local/share/screenpipe/personal",
-            "exists": True,
-            "size_bytes": 89128960,
-            "size_human": "85M",
-            "selected": active == "personal",
-            "recording": False,
-            "unit_active": paused,
-            "health": paused,
-            "agent_share": False,
-            "agent": {"share": False, "label": "Personal", "note": "Never shared."},
-            "hermes": {"share": False},
-        },
-    ]
-    active_org = next(o for o in orgs if o["id"] == active)
-    agent = active_org["agent"]
+    in_meeting = view not in ("paused", "idle", "pending")
+    pending_only = view == "pending"
     return {
         "ready": True,
         "demo": True,
         "demoView": view,
-        "paused": paused,
-        "recording": recording,
-        "mode": "auto",
-        "org": active,
-        "desired": active,
-        "detected": active,
-        "reason": "focus:app:Slack" if recording else "default",
-        "label": active_org["label"],
-        "short": active_org["short"],
-        "port": active_org["port"],
-        "dir": active_org["dir"],
-        "dir_short": active_org["dir_short"],
-        "size_human": active_org["size_human"],
-        "api_url": agent.get("api_url") or f"http://127.0.0.1:{active_org['port']}",
-        "agent_share": bool(agent.get("share")),
-        "hermes_share": bool(agent.get("share")),
-        "agent": agent,
-        "hermes": agent,
-        "override": None,
-        "orgs": orgs,
+        "mode": "inbox",
+        "paused": view == "paused",
+        "recording": view != "paused",
+        "in_meeting": in_meeting,
+        "notify": in_meeting,
+        "label": "Standup" if in_meeting else "Inbox",
+        "short": "REC" if in_meeting else "In",
+        "reason": "Zoom" if in_meeting else "idle",
+        "dir_short": "~/.local/share/screenpipe/inbox",
+        "size_human": "180M",
+        "port": 3030,
+        "pending_count": 1 if pending_only or not in_meeting else 0,
+        "active_meeting": {
+            "id": 42,
+            "app": "Zoom",
+            "label": "Weekly standup",
+            "open": True,
+        }
+        if in_meeting
+        else None,
+        "pending": [
+            {
+                "id": 41,
+                "app": "Slack",
+                "label": "Client sync",
+                "open": False,
+                "filed": False,
+                "suggest": "client",
+                "suggest_label": "Client",
+            }
+        ]
+        if pending_only or not in_meeting
+        else [],
+        "orgs": [
+            {
+                "id": "work",
+                "label": "Work",
+                "short": "Wrk",
+                "dir_short": "~/.local/share/screenpipe/work",
+                "size_human": "1.1G",
+                "agent_share": False,
+            },
+            {
+                "id": "client",
+                "label": "Client",
+                "short": "Cli",
+                "dir_short": "/mnt/storage/screenpipe/client",
+                "size_human": "420M",
+                "agent_share": True,
+            },
+            {
+                "id": "personal",
+                "label": "Personal",
+                "short": "Me",
+                "dir_short": "~/.local/share/screenpipe/personal",
+                "size_human": "90M",
+                "agent_share": False,
+            },
+        ],
+        "destinations": [],
         "hint": "",
     }
 
 
 def status_json() -> dict:
-    view = demo_view()
-    if view:
-        return demo_payload(view)
-
+    if demo_view():
+        return demo_payload(demo_view())
     r = sp("status", "--json")
     if r.returncode != 0 or not r.stdout.strip():
         return {
             "ready": False,
             "paused": True,
             "recording": False,
-            "mode": "unknown",
-            "org": "",
-            "label": "Screenpipe",
-            "short": "?",
-            "reason": (r.stderr or r.stdout or "sp-org failed").strip()[:200],
+            "mode": "inbox",
             "orgs": [],
-            "hint": "Install sp-org and create ~/.config/screenpipe/orgs.toml from examples/",
+            "pending": [],
+            "hint": (r.stderr or r.stdout or "sp-org failed")[:200],
         }
     try:
         return json.loads(r.stdout)
     except json.JSONDecodeError:
-        return {"ready": False, "hint": "bad json from sp-org", "orgs": []}
+        return {"ready": False, "hint": "bad json", "orgs": [], "pending": []}
 
 
 def main(argv: list[str]) -> int:
@@ -165,8 +122,7 @@ def main(argv: list[str]) -> int:
         print(json.dumps(status_json()))
         return 0
 
-    action = argv[1]
-    if action == "action":
+    if argv[1] == "action":
         if demo_view():
             print(json.dumps(demo_payload(demo_view())))
             return 0
@@ -174,43 +130,35 @@ def main(argv: list[str]) -> int:
             print(json.dumps({"ok": False, "error": "missing action"}))
             return 1
         sub = argv[2]
-        # pick-dir <org>  |  set-dir <org> <path>  |  plain verbs / org ids
-        if sub == "pick-dir":
-            if len(argv) < 4:
-                print(json.dumps({"ok": False, "error": "pick-dir needs org id"}))
-                return 1
-            r = sp("pick-dir", argv[3])
-            out = r.stdout.strip() or "{}"
-            try:
-                st = json.loads(out)
-            except json.JSONDecodeError:
+        if sub == "file":
+            r = sp("file", argv[3], argv[4]) if len(argv) >= 5 else sp("status", "--json")
+        elif sub == "pick-dir":
+            r = sp("pick-dir", argv[3]) if len(argv) >= 4 else sp("status", "--json")
+        elif sub in ("pause", "resume", "ack", "ensure"):
+            r = sp(sub)
+            if sub != "ack":
+                # ensure status json
                 st = status_json()
-            st["ok"] = r.returncode == 0
-            print(json.dumps(st))
-            return 0 if r.returncode == 0 else 1
-        if sub == "set-dir":
-            if len(argv) < 5:
-                print(json.dumps({"ok": False, "error": "set-dir needs org id and path"}))
-                return 1
-            r = sp("set-dir", argv[3], argv[4], "--json")
-            out = r.stdout.strip() or "{}"
-            try:
-                st = json.loads(out)
-            except json.JSONDecodeError:
-                st = status_json()
-            st["ok"] = r.returncode == 0
-            print(json.dumps(st))
-            return 0 if r.returncode == 0 else 1
+                st["ok"] = r.returncode == 0
+                if r.returncode != 0:
+                    st["error"] = (r.stderr or r.stdout or "")[:300]
+                print(json.dumps(st))
+                return 0 if r.returncode == 0 else 1
+        else:
+            r = sp(sub)
 
-        r = sp(sub)
-        st = status_json()
+        out = (r.stdout or "").strip()
+        try:
+            st = json.loads(out) if out.startswith("{") else status_json()
+        except json.JSONDecodeError:
+            st = status_json()
         st["ok"] = r.returncode == 0
-        if r.returncode != 0:
-            st["error"] = (r.stderr or r.stdout or "failed").strip()[:300]
+        if r.returncode != 0 and "error" not in st:
+            st["error"] = (r.stderr or r.stdout or "failed")[:300]
         print(json.dumps(st))
         return 0 if r.returncode == 0 else 1
 
-    if action == "demo":
+    if argv[1] == "demo":
         print(json.dumps(demo_payload(argv[2] if len(argv) > 2 else "default")))
         return 0
 

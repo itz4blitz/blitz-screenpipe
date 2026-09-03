@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""sp-org — multi-bucket Screenpipe control.
+"""sp-org — Screenpipe inbox + file-later destinations.
 
-Org names, ports, units, routes, and agent targets come ONLY from
-~/.config/screenpipe/*. Nothing personal is hardcoded here.
-
-One recorder active at a time. Auto mode picks a bucket from Hyprland
-windows using org-routes.toml. Manual switch pins an override until cleared.
+One always-on recorder writes to an inbox folder. Meetings are detected
+locally. Nothing is copied into a labeled destination until you file it
+from the bar (or CLI). Optional route hints can suggest a destination
+after the fact — they never auto-file.
 """
 from __future__ import annotations
 
 import json
 import re
+import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -22,9 +23,17 @@ STATE_PATH = CONFIG_DIR / "active.json"
 ORGS_PATH = CONFIG_DIR / "orgs.toml"
 ROUTES_PATH = CONFIG_DIR / "org-routes.toml"
 AGENT_PATH = CONFIG_DIR / "agent-targets.json"
-OVERRIDE_PATH = CONFIG_DIR / "override.json"
-# Legacy filename still read if agent-targets.json is missing
+FILINGS_PATH = CONFIG_DIR / "filings.json"
+OVERRIDE_PATH = CONFIG_DIR / "override.json"  # unused in inbox mode; kept for cleanup
 LEGACY_HERMES_PATH = CONFIG_DIR / "hermes-targets.json"
+
+DEFAULT_INBOX = {
+    "label": "Inbox",
+    "short": "In",
+    "port": 3030,
+    "dir": str(HOME / ".local/share/screenpipe/inbox"),
+    "unit": "screenpipe-inbox.service",
+}
 
 
 def _run(cmd: list[str], timeout: float = 8.0) -> subprocess.CompletedProcess[str]:
@@ -38,7 +47,6 @@ def _run(cmd: list[str], timeout: float = 8.0) -> subprocess.CompletedProcess[st
 
 
 def _parse_toml_simple(text: str) -> dict:
-    """Minimal TOML subset: [section], [section.key], key = "str"|[list]|bool|int."""
     root: dict = {}
     section: list[str] = []
 
@@ -53,9 +61,8 @@ def _parse_toml_simple(text: str) -> dict:
         if not line:
             continue
         if line.startswith("[") and line.endswith("]"):
-            inner = line[1:-1].strip()
-            section = [p.strip() for p in inner.split(".") if p.strip()]
-            cursor()  # ensure exists
+            section = [p.strip() for p in line[1:-1].split(".") if p.strip()]
+            cursor()
             continue
         if "=" not in line:
             continue
@@ -92,189 +99,22 @@ def expand_path(value: str) -> str:
     return str(Path(value).expanduser())
 
 
-def load_orgs() -> dict[str, dict]:
-    """Load org buckets from orgs.toml. Empty dict if missing."""
-    if not ORGS_PATH.exists():
-        return {}
-    data = _parse_toml_simple(ORGS_PATH.read_text())
-    raw = data.get("orgs") or {}
-    out: dict[str, dict] = {}
-    for org_id, meta in raw.items():
-        if not isinstance(meta, dict):
-            continue
-        port = int(meta.get("port") or 0)
-        data_dir = expand_path(
-            str(meta.get("data_dir") or f"~/.local/share/screenpipe/{org_id}")
-        )
-        unit = str(meta.get("unit") or f"screenpipe-{org_id}.service")
-        out[org_id] = {
-            "id": org_id,
-            "label": str(meta.get("label") or org_id),
-            "short": str(meta.get("short") or org_id[:3].title()),
-            "port": port,
-            "dir": data_dir,
-            "unit": unit,
-            "agent_share": bool(meta.get("agent_share", False)),
-        }
-    return out
+def shorten_path(path: str) -> str:
+    home = str(HOME)
+    if path.startswith(home + "/") or path == home:
+        return "~" + path[len(home) :]
+    return path
 
 
-def load_routes() -> dict:
-    defaults = {
-        "default": "personal",
-        "slack_default": None,
-        "apps": {},
-        "slack": {},
-        "meet": {},
-    }
-    if not ROUTES_PATH.exists():
-        return defaults
-    data = _parse_toml_simple(ROUTES_PATH.read_text())
-    routes = dict(defaults)
-    if "default" in data:
-        routes["default"] = data["default"]
-    if "slack_default" in data:
-        routes["slack_default"] = data["slack_default"]
-    # top-level tables
-    for key in ("apps", "slack", "meet"):
-        if isinstance(data.get(key), dict):
-            routes[key] = {
-                k: v if isinstance(v, list) else []
-                for k, v in data[key].items()
-                if k not in ("default",)
-            }
-            if "default" in data[key] and key == "slack":
-                routes["slack_default"] = data[key]["default"]
-    # allow routing.slack_default
-    routing = data.get("routing") or {}
-    if isinstance(routing, dict):
-        if "default" in routing:
-            routes["default"] = routing["default"]
-        if "slack_default" in routing:
-            routes["slack_default"] = routing["slack_default"]
-    return routes
-
-
-def load_agent_targets() -> dict:
-    path = AGENT_PATH if AGENT_PATH.exists() else LEGACY_HERMES_PATH
-    return load_json(path, {})
-
-
-def unit_active(unit: str) -> bool:
-    r = _run(["systemctl", "--user", "is-active", unit])
-    return r.stdout.strip() == "active"
-
-
-def stop_all(orgs: dict) -> None:
-    units = [o["unit"] for o in orgs.values()]
-    if units:
-        _run(["systemctl", "--user", "stop", *units], timeout=30)
-
-
-def start_org(orgs: dict, org: str) -> None:
-    stop_all(orgs)
-    _run(["systemctl", "--user", "start", orgs[org]["unit"]], timeout=30)
-    time.sleep(0.6)
-
-
-def hypr_clients() -> list[dict]:
-    r = _run(["hyprctl", "clients", "-j"])
-    if r.returncode != 0 or not r.stdout.strip():
-        return []
-    try:
-        return json.loads(r.stdout)
-    except json.JSONDecodeError:
-        return []
-
-
-def hypr_active() -> dict | None:
-    r = _run(["hyprctl", "activewindow", "-j"])
-    if r.returncode != 0 or not r.stdout.strip():
-        return None
-    try:
-        return json.loads(r.stdout)
-    except json.JSONDecodeError:
-        return None
-
-
-def _contains_any(hay: str, needles: list[str]) -> bool:
-    h = hay.lower()
-    return any(n.lower() in h for n in needles if n)
-
-
-def _classify_blob(blob: str, routes: dict, orgs: dict) -> tuple[str, str] | None:
-    b = blob.lower()
-
-    for org_id, needles in (routes.get("meet") or {}).items():
-        if org_id in orgs and needles and _contains_any(blob, needles):
-            return org_id, f"meet:{needles[0]}"
-
-    if "meet.google.com" in b:
-        return routes.get("default") or next(iter(orgs), "personal"), "meet:unmapped"
-
-    for org_id, needles in (routes.get("apps") or {}).items():
-        if org_id in orgs and needles and _contains_any(blob, needles):
-            return org_id, f"app:{needles[0]}"
-
-    if "slack" in b or " - slack" in b:
-        for org_id, needles in (routes.get("slack") or {}).items():
-            if org_id in orgs and needles and _contains_any(blob, needles):
-                return org_id, f"slack:{org_id}"
-        slack_default = routes.get("slack_default")
-        if slack_default in orgs:
-            return slack_default, "slack:default"
-        fallback = routes.get("default")
-        if fallback in orgs:
-            return fallback, "slack:fallback"
-
-    return None
-
-
-def detect_org(routes: dict, orgs: dict) -> tuple[str, str]:
-    default = routes.get("default") if routes.get("default") in orgs else (
-        next(iter(orgs), "personal")
-    )
-
-    active = hypr_active()
-    if active:
-        blob = f"{active.get('class') or ''} {active.get('title') or ''}"
-        hit = _classify_blob(blob, routes, orgs)
-        if hit:
-            org, reason = hit
-            return org, f"focus:{reason}"
-
-    buckets: dict[str, tuple[str, str]] = {}
-    for c in hypr_clients():
-        blob = f"{c.get('class') or ''} {c.get('title') or ''}"
-        hit = _classify_blob(blob, routes, orgs)
-        if hit:
-            org, reason = hit
-            buckets.setdefault(org, (org, reason))
-
-    # Prefer non-default buckets when focus had no signal
-    for org_id, pair in buckets.items():
-        if org_id != default:
-            return pair
-    if default in buckets:
-        return buckets[default]
-    return default, "default"
-
-
-def current_recording_org(orgs: dict) -> str | None:
-    for key, meta in orgs.items():
-        if unit_active(meta["unit"]):
-            return key
-    return None
-
-
-def health_ok(port: int) -> bool:
-    if not port:
-        return False
-    try:
-        r = _run(["curl", "-sf", f"http://127.0.0.1:{port}/health"], timeout=2)
-        return r.returncode == 0
-    except Exception:
-        return False
+def human_bytes(n: int) -> str:
+    x = float(n)
+    for unit in ("B", "K", "M", "G", "T"):
+        if x < 1024 or unit == "T":
+            if unit == "B":
+                return f"{int(x)}B"
+            return f"{x:.0f}{unit}" if x >= 10 else f"{x:.1f}{unit}"
+        x /= 1024
+    return f"{n}B"
 
 
 def dir_size_bytes(path: str) -> int:
@@ -294,24 +134,6 @@ def dir_size_bytes(path: str) -> int:
     return total
 
 
-def human_bytes(n: int) -> str:
-    x = float(n)
-    for unit in ("B", "K", "M", "G", "T"):
-        if x < 1024 or unit == "T":
-            if unit == "B":
-                return f"{int(x)}B"
-            return f"{x:.0f}{unit}" if x >= 10 or unit == "K" else f"{x:.1f}{unit}"
-        x /= 1024
-    return f"{n}B"
-
-
-def shorten_path(path: str) -> str:
-    home = str(HOME)
-    if path.startswith(home + "/") or path == home:
-        return "~" + path[len(home) :]
-    return path
-
-
 def storage_info(path: str) -> dict:
     p = Path(path)
     size = dir_size_bytes(path) if p.exists() else 0
@@ -324,53 +146,117 @@ def storage_info(path: str) -> dict:
     }
 
 
-def set_org_data_dir(org_id: str, new_dir: str) -> None:
-    """Update data_dir in orgs.toml for org_id (preserves the rest of the file)."""
+def load_inbox() -> dict:
+    data = _parse_toml_simple(ORGS_PATH.read_text()) if ORGS_PATH.exists() else {}
+    raw = data.get("inbox") or {}
+    port = int(raw.get("port") or DEFAULT_INBOX["port"])
+    data_dir = expand_path(str(raw.get("data_dir") or DEFAULT_INBOX["dir"]))
+    unit = str(raw.get("unit") or DEFAULT_INBOX["unit"])
+    return {
+        "label": str(raw.get("label") or DEFAULT_INBOX["label"]),
+        "short": str(raw.get("short") or DEFAULT_INBOX["short"]),
+        "port": port,
+        "dir": data_dir,
+        "unit": unit,
+    }
+
+
+def load_orgs() -> dict[str, dict]:
+    """Destinations to file into (not live recorders)."""
     if not ORGS_PATH.exists():
-        raise SystemExit(f"missing {ORGS_PATH}")
-    abs_dir = expand_path(new_dir)
-    Path(abs_dir).mkdir(parents=True, exist_ok=True)
-    # Prefer ~ form in the config file when under $HOME
-    home = str(HOME)
-    stored = ("~" + abs_dir[len(home) :]) if abs_dir.startswith(home) else abs_dir
-    text = ORGS_PATH.read_text()
-    section = f"[orgs.{org_id}]"
-    if section not in text:
-        raise SystemExit(f"no {section} in {ORGS_PATH}")
-    parts = text.split(section, 1)
-    head, rest = parts[0], parts[1]
-    # next section starts at next [orgs. or end
-    m = re.search(r"\n\[orgs\.", rest)
-    if m:
-        body, tail = rest[: m.start()], rest[m.start() :]
-    else:
-        body, tail = rest, ""
-    if re.search(r"(?m)^\s*data_dir\s*=", body):
-        body = re.sub(
-            r'(?m)^(\s*data_dir\s*=\s*)"[^"]*"',
-            rf'\1"{stored}"',
-            body,
-            count=1,
+        return {}
+    data = _parse_toml_simple(ORGS_PATH.read_text())
+    raw = data.get("orgs") or {}
+    out: dict[str, dict] = {}
+    for org_id, meta in raw.items():
+        if not isinstance(meta, dict):
+            continue
+        data_dir = expand_path(
+            str(meta.get("data_dir") or f"~/.local/share/screenpipe/{org_id}")
         )
-    else:
-        body = body.rstrip() + f'\ndata_dir = "{stored}"\n'
-    ORGS_PATH.write_text(head + section + body + tail)
+        out[org_id] = {
+            "id": org_id,
+            "label": str(meta.get("label") or org_id),
+            "short": str(meta.get("short") or org_id[:3].title()),
+            "port": int(meta.get("port") or 0),
+            "dir": data_dir,
+            "unit": str(meta.get("unit") or f"screenpipe-{org_id}.service"),
+            "agent_share": bool(meta.get("agent_share", False)),
+        }
+    return out
 
 
-def write_one_unit(org_id: str, meta: dict) -> Path:
+def load_routes() -> dict:
+    defaults = {"default": None, "apps": {}, "slack": {}, "meet": {}, "slack_default": None}
+    if not ROUTES_PATH.exists():
+        return defaults
+    data = _parse_toml_simple(ROUTES_PATH.read_text())
+    routes = dict(defaults)
+    if "default" in data:
+        routes["default"] = data["default"]
+    if "slack_default" in data:
+        routes["slack_default"] = data["slack_default"]
+    for key in ("apps", "slack", "meet"):
+        if isinstance(data.get(key), dict):
+            routes[key] = {
+                k: v if isinstance(v, list) else []
+                for k, v in data[key].items()
+                if k != "default"
+            }
+            if key == "slack" and "default" in data[key]:
+                routes["slack_default"] = data[key]["default"]
+    return routes
+
+
+def load_agent_targets() -> dict:
+    path = AGENT_PATH if AGENT_PATH.exists() else LEGACY_HERMES_PATH
+    return load_json(path, {})
+
+
+def load_filings() -> dict:
+    data = load_json(FILINGS_PATH, {"filings": []})
+    if not isinstance(data.get("filings"), list):
+        data["filings"] = []
+    return data
+
+
+def filed_ids() -> set[int]:
+    return {
+        int(f["meeting_id"])
+        for f in load_filings().get("filings", [])
+        if f.get("meeting_id") is not None
+    }
+
+
+def unit_active(unit: str) -> bool:
+    return _run(["systemctl", "--user", "is-active", unit]).stdout.strip() == "active"
+
+
+def health_ok(port: int) -> bool:
+    if not port:
+        return False
+    try:
+        return _run(["curl", "-sf", f"http://127.0.0.1:{port}/health"], timeout=2).returncode == 0
+    except Exception:
+        return False
+
+
+def write_inbox_unit(inbox: dict) -> Path:
     native = HOME / ".local/bin/screenpipe-native"
     unit_dir = HOME / ".config/systemd/user"
     unit_dir.mkdir(parents=True, exist_ok=True)
-    path = unit_dir / meta["unit"]
-    body = f"""[Unit]
-Description=Screenpipe recorder ({meta['label']})
+    Path(inbox["dir"]).mkdir(parents=True, exist_ok=True)
+    path = unit_dir / inbox["unit"]
+    path.write_text(
+        f"""[Unit]
+Description=Screenpipe inbox recorder (file later)
 After=default.target
 
 [Service]
 Type=simple
 ExecStart={native} record \\
-  --data-dir {meta['dir']} \\
-  --port {meta['port']} \\
+  --data-dir {inbox['dir']} \\
+  --port {inbox['port']} \\
   --language english \\
   --use-pii-removal true
 Restart=on-failure
@@ -381,107 +267,184 @@ Environment=PATH={HOME}/.local/bin:{HOME}/.local/share/mise/shims:/usr/bin:/bin
 [Install]
 WantedBy=default.target
 """
-    path.write_text(body)
+    )
     return path
+
+
+def stop_legacy_recorders(orgs: dict, inbox: dict) -> None:
+    units = [o["unit"] for o in orgs.values() if o.get("unit") and o["unit"] != inbox["unit"]]
+    if units:
+        _run(["systemctl", "--user", "stop", *units], timeout=60)
+
+
+def ensure_inbox_running() -> dict:
+    inbox = load_inbox()
+    orgs = load_orgs()
+    stop_legacy_recorders(orgs, inbox)
+    write_inbox_unit(inbox)
+    _run(["systemctl", "--user", "daemon-reload"])
+    _run(["systemctl", "--user", "enable", inbox["unit"]], timeout=15)
+    if not unit_active(inbox["unit"]):
+        _run(["systemctl", "--user", "start", inbox["unit"]], timeout=30)
+        time.sleep(0.8)
+    return inbox
+
+
+def inbox_db(inbox: dict) -> Path:
+    return Path(inbox["dir"]) / "db.sqlite"
+
+
+def list_meetings(inbox: dict, *, limit: int = 20) -> list[dict]:
+    db = inbox_db(inbox)
+    if not db.exists():
+        return []
+    filed = filed_ids()
+    rows = []
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        con.row_factory = sqlite3.Row
+        cur = con.execute(
+            """
+            SELECT id, meeting_start, meeting_end, meeting_app, title, attendees,
+                   detection_source, end_reason
+            FROM meetings
+            ORDER BY meeting_start DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        for r in cur.fetchall():
+            mid = int(r["id"])
+            open_meeting = r["meeting_end"] is None
+            rows.append(
+                {
+                    "id": mid,
+                    "start": r["meeting_start"],
+                    "end": r["meeting_end"],
+                    "app": r["meeting_app"] or "",
+                    "title": r["title"] or "",
+                    "attendees": r["attendees"] or "",
+                    "source": r["detection_source"] or "",
+                    "open": open_meeting,
+                    "filed": mid in filed and not open_meeting,
+                    "label": (r["title"] or r["meeting_app"] or f"Meeting {mid}"),
+                }
+            )
+        con.close()
+    except sqlite3.Error:
+        return []
+    return rows
+
+
+def _contains_any(hay: str, needles: list[str]) -> bool:
+    h = hay.lower()
+    return any(n.lower() in h for n in needles if n)
+
+
+def suggest_dest(meeting: dict, routes: dict, orgs: dict) -> str | None:
+    """Hint only — never auto-files."""
+    blob = f"{meeting.get('app', '')} {meeting.get('title', '')} {meeting.get('attendees', '')}"
+    for org_id, needles in (routes.get("meet") or {}).items():
+        if org_id in orgs and needles and _contains_any(blob, needles):
+            return org_id
+    for org_id, needles in (routes.get("apps") or {}).items():
+        if org_id in orgs and needles and _contains_any(blob, needles):
+            return org_id
+    if "slack" in blob.lower():
+        for org_id, needles in (routes.get("slack") or {}).items():
+            if org_id in orgs and needles and _contains_any(blob, needles):
+                return org_id
+        if routes.get("slack_default") in orgs:
+            return routes["slack_default"]
+    if routes.get("default") in orgs:
+        return routes["default"]
+    return None
 
 
 def build_status() -> dict:
     orgs = load_orgs()
-    if not orgs:
+    if not orgs and not ORGS_PATH.exists():
         return {
             "ready": False,
-            "paused": True,
+            "mode": "inbox",
             "recording": False,
-            "mode": "auto",
-            "org": "",
-            "label": "Screenpipe",
-            "short": "?",
-            "reason": "missing ~/.config/screenpipe/orgs.toml",
-            "hint": "Copy examples/orgs.example.toml from blitz.screenpipe and edit.",
+            "paused": True,
+            "in_meeting": False,
+            "hint": "Create ~/.config/screenpipe/orgs.toml (destinations) and run: sp-org ensure",
             "orgs": [],
-            "api_url": "",
-            "agent_share": False,
-            "agent": {},
+            "pending": [],
+            "active_meeting": None,
         }
 
-    routes = load_routes()
+    inbox = load_inbox()
     agents = load_agent_targets()
-    override = load_json(OVERRIDE_PATH, {})
+    routes = load_routes()
     state = load_json(STATE_PATH, {})
     paused = bool(state.get("paused"))
-    detected, reason = detect_org(routes, orgs)
+    running = unit_active(inbox["unit"]) and not paused
+    healthy = health_ok(inbox["port"]) if running else False
+    store = storage_info(inbox["dir"])
 
-    if override.get("org") in orgs:
-        selected = override["org"]
-        select_reason = f"manual:{override.get('reason', 'override')}"
-        mode_effective = "manual"
-    else:
-        selected = detected if detected in orgs else next(iter(orgs))
-        select_reason = reason
-        mode_effective = "auto"
+    meetings = list_meetings(inbox)
+    active = next((m for m in meetings if m["open"]), None)
+    pending = []
+    for m in meetings:
+        if m["open"] or m["filed"]:
+            continue
+        hint = suggest_dest(m, routes, orgs)
+        pending.append({**m, "suggest": hint, "suggest_label": orgs[hint]["label"] if hint in orgs else None})
 
-    recording = current_recording_org(orgs)
-    active = None if paused else recording
-    desired = selected
-    chip_org = active or desired
-    meta = orgs[chip_org]
-    agent = agents.get(chip_org, {})
+    # Notify flag for bar: new open meeting since last ack
+    last_notified = state.get("notified_meeting_id")
+    notify = bool(active and active["id"] != last_notified)
 
-    org_rows = []
+    dest_rows = []
     for key, o in orgs.items():
         a = agents.get(key, {})
-        store = storage_info(o["dir"])
-        org_rows.append(
+        ds = storage_info(o["dir"])
+        dest_rows.append(
             {
                 "id": key,
                 "label": o["label"],
                 "short": o["short"],
-                "port": o["port"],
-                "dir": store["dir"],
-                "dir_short": store["dir_short"],
-                "exists": store["exists"],
-                "size_bytes": store["size_bytes"],
-                "size_human": store["size_human"],
-                "unit_active": unit_active(o["unit"]),
-                "health": health_ok(o["port"]) if unit_active(o["unit"]) else False,
-                "selected": key == desired,
-                "recording": key == recording and not paused,
+                "dir": ds["dir"],
+                "dir_short": ds["dir_short"],
+                "size_human": ds["size_human"],
+                "exists": ds["exists"],
                 "agent_share": bool(o.get("agent_share")) or bool(a.get("share")),
                 "agent": a,
-                # keep legacy key for older UI builds
                 "hermes": a,
             }
         )
 
-    share = bool(meta.get("agent_share")) or bool(agent.get("share"))
-    api = agent.get("api_url") or (f"http://127.0.0.1:{meta['port']}" if meta["port"] else "")
-    active_store = storage_info(meta["dir"])
-
     return {
         "ready": True,
+        "mode": "inbox",
         "paused": paused,
-        "recording": bool(active) and not paused,
-        "mode": mode_effective,
-        "org": chip_org,
-        "desired": desired,
-        "detected": detected,
-        "reason": select_reason,
-        "label": meta["label"],
-        "short": meta["short"],
-        "port": meta["port"],
-        "dir": active_store["dir"],
-        "dir_short": active_store["dir_short"],
-        "size_human": active_store["size_human"],
-        "api_url": api,
-        "agent_share": share and bool(api),
-        "hermes_share": share and bool(api),  # legacy
-        "agent": agent,
-        "hermes": agent,  # legacy
-        "override": override.get("org"),
-        "orgs": org_rows,
-        "routes_path": str(ROUTES_PATH),
-        "orgs_path": str(ORGS_PATH),
-        "agent_path": str(AGENT_PATH),
+        "recording": running,
+        "health": healthy,
+        "in_meeting": active is not None,
+        "notify": notify,
+        "label": active["label"] if active else inbox["label"],
+        "short": "REC" if active else inbox["short"],
+        "org": "",  # no live org bucket
+        "port": inbox["port"],
+        "api_url": f"http://127.0.0.1:{inbox['port']}",
+        "dir": store["dir"],
+        "dir_short": store["dir_short"],
+        "size_human": store["size_human"],
+        "inbox": {**inbox, **store, "unit_active": unit_active(inbox["unit"])},
+        "active_meeting": active,
+        "pending": pending,
+        "pending_count": len(pending),
+        "orgs": dest_rows,  # destinations
+        "destinations": dest_rows,
+        "agent_share": False,
+        "hermes_share": False,
+        "agent": {},
+        "hermes": {},
+        "hint": "",
+        "reason": (active["app"] if active else ("paused" if paused else "idle")),
     }
 
 
@@ -492,44 +455,16 @@ def persist_state(**kwargs) -> dict:
     st = build_status()
     payload = {
         **state,
-        "org": st.get("org"),
-        "desired": st.get("desired"),
+        "mode": "inbox",
         "paused": st.get("paused"),
         "recording": st.get("recording"),
-        "mode": st.get("mode"),
-        "reason": st.get("reason"),
-        "api_url": st.get("api_url"),
-        "agent": st.get("agent"),
-        "label": st.get("label"),
+        "in_meeting": st.get("in_meeting"),
+        "active_meeting": st.get("active_meeting"),
+        "pending_count": st.get("pending_count"),
+        "dir": st.get("dir"),
     }
     save_json(STATE_PATH, payload)
     return st
-
-
-def apply_desired(
-    desired: str,
-    *,
-    paused: bool | None = None,
-    mode: str | None = None,
-    reason: str = "",
-) -> dict:
-    orgs = load_orgs()
-    if desired not in orgs:
-        raise SystemExit(f"unknown org id: {desired!r} (edit {ORGS_PATH})")
-    state = load_json(STATE_PATH, {})
-    if paused is None:
-        paused = bool(state.get("paused"))
-    if mode is None:
-        mode = "auto"
-
-    if paused:
-        stop_all(orgs)
-    else:
-        current = current_recording_org(orgs)
-        if current != desired:
-            start_org(orgs, desired)
-
-    return persist_state(paused=paused, mode=mode, last_reason=reason, last_org=desired)
 
 
 def cmd_status(as_json: bool) -> int:
@@ -538,159 +473,181 @@ def cmd_status(as_json: bool) -> int:
         print(json.dumps(st))
         return 0
     if not st.get("ready"):
-        print(st.get("hint") or st.get("reason") or "not configured")
+        print(st.get("hint") or "not ready")
         return 1
-    print(f"mode={st['mode']}  paused={st['paused']}  recording={st['recording']}")
-    print(f"org={st['org']} ({st['label']})  reason={st['reason']}  api={st['api_url']}")
-    print(f"storage={st.get('dir_short')}  ({st.get('size_human')})")
-    if st.get("override"):
-        print(f"override={st['override']} (sp-org clear to return to auto)")
-    agent = st.get("agent") or {}
-    print(f"agent_share={bool(st.get('agent_share'))}  {agent.get('label', '')}  {agent.get('note', '')}")
-    print()
-    for o in st["orgs"]:
-        mark = "*" if o["selected"] else " "
-        rec = "REC" if o["recording"] else ("on " if o["unit_active"] else "   ")
-        print(f" {mark} {o['id']:<12} {rec}  :{o['port']}  {o['size_human']:>5}  {o['dir_short']}  {o['label']}")
+    print(f"mode=inbox  recording={st['recording']}  paused={st['paused']}  in_meeting={st['in_meeting']}")
+    print(f"inbox={st['dir_short']}  ({st['size_human']})  :{st['port']}")
+    if st.get("active_meeting"):
+        m = st["active_meeting"]
+        print(f"LIVE meeting #{m['id']}  {m['app']}  {m['label']}")
+    print(f"pending_unfiled={st['pending_count']}")
+    for m in st.get("pending", [])[:5]:
+        sug = f"  suggest={m['suggest']}" if m.get("suggest") else ""
+        print(f"  #{m['id']}  {m['app']}  {m['label']}{sug}")
+    print("destinations:")
+    for o in st.get("destinations", []):
+        print(f"  {o['id']:<12} {o['size_human']:>5}  {o['dir_short']}  {o['label']}")
     return 0
 
 
-def cmd_switch(org: str, manual: bool = True) -> int:
-    orgs = load_orgs()
-    if org not in orgs:
-        print(f"unknown org: {org}", file=sys.stderr)
-        print(f"known: {', '.join(orgs) or '(none — create orgs.toml)'}", file=sys.stderr)
-        return 1
-    if manual:
-        save_json(OVERRIDE_PATH, {"org": org, "reason": "cli", "at": time.time()})
-        mode = "manual"
-    else:
-        mode = "auto"
-    st = apply_desired(org, paused=False, mode=mode, reason="switch")
-    if "--json" in sys.argv:
-        print(json.dumps(st))
-    else:
-        print(f"switched → {st['label']} (:{st['port']})")
-    return 0
-
-
-def cmd_clear() -> int:
-    if OVERRIDE_PATH.exists():
-        OVERRIDE_PATH.unlink()
-    orgs = load_orgs()
-    routes = load_routes()
-    detected, reason = detect_org(routes, orgs)
-    st = apply_desired(detected, paused=False, mode="auto", reason=reason)
-    print(f"auto → {st['label']} ({st['reason']})")
+def cmd_ensure() -> int:
+    inbox = ensure_inbox_running()
+    st = persist_state(paused=False)
+    print(f"inbox running → {inbox['dir']} :{inbox['port']}  recording={st['recording']}")
     return 0
 
 
 def cmd_pause() -> int:
-    state = load_json(STATE_PATH, {})
-    orgs = load_orgs()
-    desired = state.get("desired") or state.get("org") or next(iter(orgs), "")
-    apply_desired(desired, paused=True, reason="pause")
-    print("paused")
+    inbox = load_inbox()
+    _run(["systemctl", "--user", "stop", inbox["unit"]], timeout=30)
+    persist_state(paused=True)
+    print("paused (inbox recorder stopped)")
     return 0
 
 
 def cmd_resume() -> int:
-    orgs = load_orgs()
-    routes = load_routes()
-    override = load_json(OVERRIDE_PATH, {})
-    if override.get("org") in orgs:
-        desired = override["org"]
-        reason = "resume:manual"
-        mode = "manual"
-    else:
-        desired, reason = detect_org(routes, orgs)
-        mode = "auto"
-    st = apply_desired(desired, paused=False, mode=mode, reason=reason)
-    print(f"resumed → {st['label']}")
+    ensure_inbox_running()
+    persist_state(paused=False)
+    print("resumed")
     return 0
 
 
-def cmd_auto_tick() -> int:
-    state = load_json(STATE_PATH, {})
-    orgs = load_orgs()
-    if not orgs:
-        return 0
-    if bool(state.get("paused")):
-        stop_all(orgs)
-        persist_state(paused=True)
-        return 0
-
-    override = load_json(OVERRIDE_PATH, {})
-    if override.get("org") in orgs:
-        apply_desired(override["org"], paused=False, mode="manual", reason="manual-hold")
-        return 0
-
-    routes = load_routes()
-    detected, reason = detect_org(routes, orgs)
-    current = current_recording_org(orgs)
-    if current != detected:
-        apply_desired(detected, paused=False, mode="auto", reason=reason)
-    else:
-        persist_state(mode="auto", paused=False, last_reason=reason, last_org=detected)
-    return 0
-
-
-def cmd_agent() -> int:
+def cmd_ack() -> int:
+    """Acknowledge meeting notification so the bar stops nagging."""
     st = build_status()
-    agent = st.get("agent") or {}
-    out = {
-        "org": st.get("org"),
-        "share": bool(st.get("agent_share")),
-        "api_url": agent.get("api_url") or st.get("api_url"),
-        "label": agent.get("label"),
-        "note": agent.get("note"),
-        "setup_hint": None,
-    }
-    if out["share"] and out["api_url"]:
-        out["setup_hint"] = f"screenpipe agent setup hermes --api-url {out['api_url']}"
-    print(json.dumps(out, indent=2))
+    active = st.get("active_meeting")
+    if active:
+        persist_state(notified_meeting_id=active["id"])
+        print(f"acked meeting #{active['id']}")
+    else:
+        persist_state(notified_meeting_id=None)
+        print("nothing to ack")
+    print(json.dumps(build_status()))
     return 0
 
 
-def cmd_write_units() -> int:
-    """Generate systemd --user units from orgs.toml (generic template)."""
+def cmd_file(meeting_id: str, dest_id: str) -> int:
     orgs = load_orgs()
-    if not orgs:
-        print(f"missing {ORGS_PATH}", file=sys.stderr)
+    if dest_id not in orgs:
+        print(f"unknown destination: {dest_id}", file=sys.stderr)
         return 1
-    for org_id, meta in orgs.items():
-        path = write_one_unit(org_id, meta)
-        print(f"wrote {path}")
-    _run(["systemctl", "--user", "daemon-reload"])
-    print("daemon-reloaded")
-    return 0
+    inbox = load_inbox()
+    try:
+        mid = int(meeting_id)
+    except ValueError:
+        print("meeting id must be int", file=sys.stderr)
+        return 1
+
+    meetings = {m["id"]: m for m in list_meetings(inbox, limit=100)}
+    if mid not in meetings:
+        print(f"meeting #{mid} not in inbox", file=sys.stderr)
+        return 1
+    meeting = meetings[mid]
+    if meeting["open"]:
+        print("meeting still open — end the call first, or file when it closes", file=sys.stderr)
+        # Still allow pre-assign? For now require closed.
+        return 1
+
+    dest = orgs[dest_id]
+    Path(dest["dir"]).mkdir(parents=True, exist_ok=True)
+    export_dir = Path(dest["dir"]) / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^\w.\-]+", "_", meeting["label"])[:60] or f"meeting_{mid}"
+    out = export_dir / f"{safe}_{mid}.mp4"
+
+    native = HOME / ".local/bin/screenpipe-native"
+    r = _run(
+        [
+            str(native),
+            "export",
+            "--meeting-id",
+            str(mid),
+            "--data-dir",
+            inbox["dir"],
+            "-o",
+            str(out),
+        ],
+        timeout=600,
+    )
+    ok = r.returncode == 0 and out.exists()
+    ledger = load_filings()
+    ledger["filings"].append(
+        {
+            "meeting_id": mid,
+            "dest": dest_id,
+            "filed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "export_path": str(out) if ok else None,
+            "export_ok": ok,
+            "app": meeting.get("app"),
+            "title": meeting.get("title"),
+            "stderr": (r.stderr or "")[-400:] if not ok else "",
+        }
+    )
+    save_json(FILINGS_PATH, ledger)
+
+    # Also drop a small json sidecar with metadata
+    meta_path = export_dir / f"{safe}_{mid}.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "meeting_id": mid,
+                "dest": dest_id,
+                "app": meeting.get("app"),
+                "title": meeting.get("title"),
+                "start": meeting.get("start"),
+                "end": meeting.get("end"),
+                "export": str(out) if ok else None,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+    st = build_status()
+    st["ok"] = ok
+    st["filed"] = {"meeting_id": mid, "dest": dest_id, "export": str(out) if ok else None}
+    if not ok:
+        st["error"] = (r.stderr or r.stdout or "export failed")[-300:]
+    print(json.dumps(st))
+    return 0 if ok else 1
 
 
-def cmd_set_dir(org_id: str, new_dir: str, *, as_json: bool = False) -> int:
+def set_org_data_dir(org_id: str, new_dir: str) -> None:
+    if not ORGS_PATH.exists():
+        raise SystemExit(f"missing {ORGS_PATH}")
+    abs_dir = expand_path(new_dir)
+    Path(abs_dir).mkdir(parents=True, exist_ok=True)
+    home = str(HOME)
+    stored = ("~" + abs_dir[len(home) :]) if abs_dir.startswith(home) else abs_dir
+    text = ORGS_PATH.read_text()
+    section = f"[orgs.{org_id}]"
+    if section not in text:
+        raise SystemExit(f"no {section} in {ORGS_PATH}")
+    parts = text.split(section, 1)
+    head, rest = parts[0], parts[1]
+    m = re.search(r"\n\[orgs\.", rest)
+    body, tail = (rest[: m.start()], rest[m.start() :]) if m else (rest, "")
+    if re.search(r"(?m)^\s*data_dir\s*=", body):
+        body = re.sub(r'(?m)^(\s*data_dir\s*=\s*)"[^"]*"', rf'\1"{stored}"', body, count=1)
+    else:
+        body = body.rstrip() + f'\ndata_dir = "{stored}"\n'
+    ORGS_PATH.write_text(head + section + body + tail)
+
+
+def cmd_set_dir(org_id: str, new_dir: str) -> int:
     orgs = load_orgs()
     if org_id not in orgs:
-        print(f"unknown org: {org_id}", file=sys.stderr)
+        print(f"unknown destination: {org_id}", file=sys.stderr)
         return 1
-    was_active = unit_active(orgs[org_id]["unit"])
     set_org_data_dir(org_id, new_dir)
-    orgs = load_orgs()
-    write_one_unit(org_id, orgs[org_id])
-    _run(["systemctl", "--user", "daemon-reload"])
-    if was_active:
-        # Retarget live recorder onto the new folder
-        start_org(orgs, org_id)
-    st = build_status()
-    if as_json or "--json" in sys.argv:
-        print(json.dumps(st))
-    else:
-        print(f"{org_id} → {st['orgs'] and next(o['dir_short'] for o in st['orgs'] if o['id']==org_id)}")
+    print(json.dumps(build_status()))
     return 0
 
 
 def cmd_pick_dir(org_id: str) -> int:
     orgs = load_orgs()
     if org_id not in orgs:
-        print(f"unknown org: {org_id}", file=sys.stderr)
+        print(f"unknown destination: {org_id}", file=sys.stderr)
         return 1
     current = orgs[org_id]["dir"]
     r = _run(
@@ -698,40 +655,53 @@ def cmd_pick_dir(org_id: str) -> int:
             "zenity",
             "--file-selection",
             "--directory",
-            f"--title=Recording folder for {orgs[org_id]['label']}",
+            f"--title=Folder for {orgs[org_id]['label']}",
             f"--filename={current}/",
         ],
         timeout=600,
     )
     if r.returncode != 0 or not r.stdout.strip():
-        # cancelled — still emit status for the panel
         print(json.dumps(build_status()))
         return 0
-    return cmd_set_dir(org_id, r.stdout.strip(), as_json=True)
+    return cmd_set_dir(org_id, r.stdout.strip())
+
+
+def cmd_watch() -> int:
+    """Watch meetings: ensure inbox up; set notify state when a call starts."""
+    while True:
+        try:
+            state = load_json(STATE_PATH, {})
+            if not state.get("paused"):
+                ensure_inbox_running()
+            st = build_status()
+            active = st.get("active_meeting")
+            prev = state.get("notified_meeting_id")
+            if active and active["id"] != prev:
+                # New call — leave notify=true until UI acks
+                persist_state(last_meeting_seen=active["id"])
+            elif not active:
+                persist_state()
+        except Exception:
+            pass
+        time.sleep(3)
 
 
 def usage(orgs: dict) -> int:
-    ids = "|".join(orgs) if orgs else "<org-id>"
+    ids = "|".join(orgs) if orgs else "<dest-id>"
     print(
         f"""Usage: sp-org <command>
 
-  status [--json]     Show buckets / storage / agent target
-  {ids}
-                      Switch bucket (sets manual override)
-  clear               Drop override, return to auto
-  pause|resume        Stop / start recording for current bucket
-  set-dir <id> <path> Point a bucket at a folder (rewrites unit; restarts if live)
-  pick-dir <id>       Zenity folder picker → set-dir
-  auto                One auto-reconcile tick
-  watch               Loop auto ticks every 3s
-  agent               Print agent share target for active bucket
-  write-units         Generate systemd user units from orgs.toml
-  paths               Print config paths
+  status [--json]          Inbox + pending meetings + destinations
+  ensure                   Start single inbox recorder; stop legacy per-org units
+  pause|resume             Stop / start inbox recorder
+  ack                      Dismiss "call started" notification
+  file <meeting-id> <dest> Export meeting into destination folder (only then)
+  set-dir <dest> <path>    Change a destination folder
+  pick-dir <dest>          Zenity picker for destination folder
+  watch                    Daemon: keep inbox up + detect new meetings
 
-Config (local only, never ship these):
-  {ORGS_PATH}
-  {ROUTES_PATH}
-  {AGENT_PATH}
+Destinations from orgs.toml: {ids}
+Inbox config: [inbox] in orgs.toml (optional)
 """,
         end="",
     )
@@ -741,9 +711,6 @@ Config (local only, never ship these):
 def main(argv: list[str]) -> int:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     orgs = load_orgs()
-    if not STATE_PATH.exists() and orgs:
-        persist_state(mode="auto", paused=False)
-
     if len(argv) < 2:
         return usage(orgs)
     cmd = argv[1]
@@ -751,42 +718,46 @@ def main(argv: list[str]) -> int:
 
     if cmd == "status":
         return cmd_status(as_json)
-    if cmd in orgs:
-        return cmd_switch(cmd, manual=True)
-    if cmd == "clear":
-        return cmd_clear()
+    if cmd == "ensure":
+        return cmd_ensure()
     if cmd == "pause":
         return cmd_pause()
     if cmd == "resume":
         return cmd_resume()
-    if cmd == "auto":
-        return cmd_auto_tick()
-    if cmd == "watch":
-        while True:
-            cmd_auto_tick()
-            time.sleep(3)
-    if cmd in ("agent", "hermes"):
-        return cmd_agent()
-    if cmd == "write-units":
-        return cmd_write_units()
+    if cmd == "ack":
+        return cmd_ack()
+    if cmd == "file":
+        if len(argv) < 4:
+            print("usage: sp-org file <meeting-id> <dest-id>", file=sys.stderr)
+            return 1
+        return cmd_file(argv[2], argv[3])
     if cmd == "set-dir":
         if len(argv) < 4:
-            print("usage: sp-org set-dir <org-id> <path>", file=sys.stderr)
+            print("usage: sp-org set-dir <dest-id> <path>", file=sys.stderr)
             return 1
-        return cmd_set_dir(argv[2], argv[3], as_json=as_json)
+        return cmd_set_dir(argv[2], argv[3])
     if cmd == "pick-dir":
         if len(argv) < 3:
-            print("usage: sp-org pick-dir <org-id>", file=sys.stderr)
+            print("usage: sp-org pick-dir <dest-id>", file=sys.stderr)
             return 1
         return cmd_pick_dir(argv[2])
+    if cmd == "watch":
+        return cmd_watch()
+    if cmd == "auto":
+        # Compat: old auto tick → ensure inbox
+        ensure_inbox_running()
+        persist_state()
+        print(json.dumps(build_status()))
+        return 0
+    if cmd in ("clear", "nymbl", "premier", "palam", "personal") or cmd in orgs:
+        # Compat: treat old org switches as no-op status (inbox mode)
+        print(json.dumps(build_status()))
+        return 0
     if cmd == "paths":
         print(f"orgs={ORGS_PATH}")
         print(f"routes={ROUTES_PATH}")
-        print(f"agent={AGENT_PATH}")
+        print(f"filings={FILINGS_PATH}")
         print(f"state={STATE_PATH}")
-        return 0
-    if cmd == "routes":
-        print(ROUTES_PATH)
         return 0
     if cmd == "stop":
         return cmd_pause()

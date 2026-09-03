@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -13,24 +12,23 @@ Panel {
   property bool ready: false
   property bool paused: true
   property bool recording: false
+  property bool inMeeting: false
+  property bool notify: false
   property bool demoLock: false
-  property string mode: "auto"
-  property string org: ""
-  property string label: "Screenpipe"
-  property string shortLabel: "?"
+  property bool filing: false
+  property string label: "Inbox"
+  property string shortLabel: "In"
   property string reason: ""
-  property string apiUrl: ""
-  property bool agentShare: false
-  property string agentLabel: ""
-  property string agentNote: ""
-  property string hint: ""
   property string dirShort: ""
   property string sizeHuman: ""
-  property var orgs: []
-  property int hoveredBucket: -1
+  property string hint: ""
+  property var activeMeeting: null
+  property var pending: []
+  property var destinations: []
+  property int selectedPending: -1
+  property int hoveredDest: -1
   property string pickingOrg: ""
 
-  // Popup surface colors (not bar colors) — readable on the card
   readonly property color foreground: Color.popups.text
   readonly property color dimColor: Util.alpha(foreground, 0.62)
   readonly property color faintColor: Util.alpha(foreground, 0.38)
@@ -44,26 +42,33 @@ Panel {
     return url.startsWith("file://") ? url.substring(7) : url
   }
 
-  readonly property string stateWord: {
-    if (!root.ready) return "Offline"
+  readonly property var selectedMeeting: {
+    if (root.activeMeeting && root.activeMeeting.open)
+      return null // can't file open meetings
+    if (root.selectedPending >= 0 && root.selectedPending < root.pending.length)
+      return root.pending[root.selectedPending]
+    if (root.pending.length > 0) return root.pending[0]
+    return null
+  }
+
+  readonly property string heroTitle: {
+    if (!root.ready) return "Screenpipe"
     if (root.paused) return "Paused"
-    if (root.recording) return "Live"
-    return "Idle"
+    if (root.inMeeting && root.activeMeeting)
+      return root.activeMeeting.label || root.activeMeeting.app || "On a call"
+    if (root.pending.length > 0)
+      return root.pending.length + " unfiled"
+    return "Inbox"
   }
 
   readonly property string heroMeta: {
-    if (!root.ready) return root.hint !== "" ? root.hint : "not configured"
-    var bits = []
-    if (root.dirShort) bits.push(root.dirShort + (root.sizeHuman ? "  ·  " + root.sizeHuman : ""))
-    bits.push(root.mode === "auto" ? "auto" : "pinned")
-    return bits.join("  ·  ")
-  }
-
-  readonly property color stateColor: {
-    if (!root.ready) return root.warnColor
-    if (root.paused) return root.faintColor
-    if (root.recording) return root.okColor
-    return root.dimColor
+    if (!root.ready) return root.hint || "not ready"
+    if (root.inMeeting)
+      return (root.activeMeeting && root.activeMeeting.app ? root.activeMeeting.app + "  ·  " : "")
+        + "recording to inbox — file when the call ends"
+    if (root.pending.length > 0)
+      return "pick a destination below"
+    return root.dirShort + (root.sizeHuman ? "  ·  " + root.sizeHuman : "")
   }
 
   function apply(payload) {
@@ -71,23 +76,24 @@ Panel {
     ready = d.ready !== false
     paused = d.paused === true
     recording = d.recording === true
-    mode = String(d.mode || "auto")
-    org = String(d.org || "")
-    label = String(d.label || "Screenpipe")
-    shortLabel = String(d.short || "?")
+    inMeeting = d.in_meeting === true
+    notify = d.notify === true
+    label = String(d.label || "Inbox")
+    shortLabel = String(d.short || "In")
     reason = String(d.reason || "")
-    apiUrl = String(d.api_url || "")
-    agentShare = (d.agent_share === true || d.hermes_share === true)
-    var h = d.agent || d.hermes || {}
-    agentLabel = String(h.label || "")
-    agentNote = String(h.note || "")
-    hint = String(d.hint || "")
-    dirShort = String(d.dir_short || d.dir || "")
+    dirShort = String(d.dir_short || "")
     sizeHuman = String(d.size_human || "")
-    orgs = Array.isArray(d.orgs) ? d.orgs : []
-    // DEMO mode auto-opens once for README shots. Do NOT bind the panel's
-    // `open` to demoLock — KeyboardPanel is a fullscreen overlay, and that
-    // OR would make outside-click / Escape unable to dismiss it.
+    hint = String(d.hint || "")
+    activeMeeting = d.active_meeting || null
+    pending = Array.isArray(d.pending) ? d.pending : []
+    destinations = Array.isArray(d.destinations) && d.destinations.length
+      ? d.destinations
+      : (Array.isArray(d.orgs) ? d.orgs : [])
+    if (selectedPending >= pending.length)
+      selectedPending = pending.length ? 0 : -1
+    if (selectedPending < 0 && pending.length)
+      selectedPending = 0
+
     if (d.demo) {
       if (!demoLock) {
         demoLock = true
@@ -96,40 +102,35 @@ Panel {
     } else if (demoLock) {
       demoLock = false
     }
+
+    // Call started → open panel once until acked
+    if (notify && !root.opened && !d.demo)
+      root.open()
   }
 
   function refresh() {
     if (!collectProc.running) collectProc.running = true
   }
 
-  function runAction(name) {
+  function runAction() {
+    var args = ["python3", root.collectorPath, "action"]
+    for (var i = 0; i < arguments.length; i++) args.push(String(arguments[i]))
     if (actionProc.running) return
-    actionProc.command = ["python3", root.collectorPath, "action", name]
+    actionProc.command = args
     actionProc.running = true
   }
 
-  function pickDir(orgId) {
-    if (actionProc.running || !orgId) return
-    pickingOrg = orgId
-    actionProc.command = ["python3", root.collectorPath, "action", "pick-dir", orgId]
-    actionProc.running = true
+  function fileTo(destId) {
+    var m = root.selectedMeeting
+    if (!m || !destId || root.filing) return
+    root.filing = true
+    root.runAction("file", String(m.id), destId)
   }
 
-  function openDir(path) {
-    if (!root.bar || !path) return
-    root.bar.run("bash -lc 'xdg-open " + JSON.stringify(path) + "'")
-  }
-
-  function openRoutes() {
-    if (root.bar) root.bar.run("bash -lc 'xdg-open \"$HOME/.config/screenpipe/org-routes.toml\"'")
-  }
-
-  function openAgentTargets() {
-    if (root.bar) root.bar.run("bash -lc 'xdg-open \"$HOME/.config/screenpipe/agent-targets.json\"'")
-  }
-
-  function bucketShares(m) {
-    return (m.agent && m.agent.share) || (m.hermes && m.hermes.share) || m.agent_share === true
+  function pickDir(destId) {
+    if (!destId) return
+    pickingOrg = destId
+    root.runAction("pick-dir", destId)
   }
 
   function triggerPress(button) {
@@ -138,6 +139,13 @@ Panel {
       return
     }
     root.toggle()
+    if (root.notify)
+      root.runAction("ack")
+  }
+
+  onOpenedChanged: {
+    if (root.opened && root.notify)
+      root.runAction("ack")
   }
 
   implicitWidth: button.implicitWidth
@@ -154,6 +162,7 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        root.filing = false
         root.pickingOrg = ""
         root.apply(text)
       }
@@ -168,7 +177,6 @@ Panel {
     onTriggered: root.refresh()
   }
 
-  // ── bar chip ──────────────────────────────────────────────
   WidgetButton {
     id: button
     anchors.fill: parent
@@ -189,26 +197,26 @@ Panel {
         width: Style.space(8)
         height: width
         radius: width / 2
-        color: root.recording ? Color.accent : "transparent"
-        border.width: root.recording ? 0 : 1.5
-        border.color: root.ready
-          ? (bar && bar.dimForeground ? bar.dimForeground : Color.muted)
-          : Color.urgent
+        color: root.inMeeting ? Color.accent
+          : (root.pending.length ? root.warnColor : "transparent")
+        border.width: (root.inMeeting || root.pending.length) ? 0 : 1.5
+        border.color: bar && bar.dimForeground ? bar.dimForeground : Color.muted
         anchors.verticalCenter: parent.verticalCenter
 
         SequentialAnimation on opacity {
-          running: root.recording
+          running: root.inMeeting
           loops: Animation.Infinite
-          NumberAnimation { from: 1.0; to: 0.28; duration: 1000; easing.type: Easing.InOutSine }
-          NumberAnimation { from: 0.28; to: 1.0; duration: 1000; easing.type: Easing.InOutSine }
+          NumberAnimation { from: 1.0; to: 0.28; duration: 900; easing.type: Easing.InOutSine }
+          NumberAnimation { from: 0.28; to: 1.0; duration: 900; easing.type: Easing.InOutSine }
         }
       }
 
       Text {
-        text: root.shortLabel
-        color: root.recording
-          ? Color.accent
-          : (bar ? bar.barForeground : Color.foreground)
+        text: root.inMeeting ? "REC"
+          : (root.pending.length ? String(root.pending.length) : root.shortLabel)
+        color: root.inMeeting ? Color.accent
+          : (root.pending.length ? (bar ? bar.urgent : Color.urgent)
+            : (bar ? bar.barForeground : Color.foreground))
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         font.bold: true
@@ -217,54 +225,51 @@ Panel {
     }
   }
 
-  // ── panel ─────────────────────────────────────────────────
   KeyboardPanel {
     id: panel
     anchorItem: button
     owner: root
     bar: root.bar
     open: root.opened
-    contentWidth: panel.fittedContentWidth(Style.space(380))
+    contentWidth: panel.fittedContentWidth(Style.space(400))
     contentHeight: panel.fittedContentHeight(
-      Style.space(56)           // hero
-      + Style.space(16) + 1     // gap + hairline
-      + Style.space(16) + Style.space(34)  // gap + segment
-      + Style.space(16) + Style.space(18) + (root.orgs.length * Style.space(68))  // storage rows
-      + Style.space(16) + Style.space(88)  // agent footer
-      + Style.space(24),
-      Style.space(760)
+      Style.space(64)
+      + Style.space(20)
+      + Style.space(100)
+      + Style.space(18)
+      + (Math.max(1, root.destinations.length) * Style.space(56))
+      + Style.space(40),
+      Style.space(720)
     )
 
     Column {
-      id: panelBody
       width: parent.width
-      spacing: Style.space(16)
+      spacing: Style.space(14)
 
-      // Hero: monogram + state + pause switch
+      // Hero
       Item {
         width: parent.width
         height: Style.space(56)
 
-        // Monogram disc
         Rectangle {
           id: mono
           width: Style.space(48)
           height: width
           radius: width / 2
-          color: root.recording
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          color: root.inMeeting
             ? Qt.rgba(root.okColor.r, root.okColor.g, root.okColor.b, 0.18)
             : root.surfaceLift
           border.width: 1
-          border.color: root.recording
-            ? Qt.rgba(root.okColor.r, root.okColor.g, root.okColor.b, 0.55)
+          border.color: root.inMeeting
+            ? Util.alpha(root.okColor, 0.5)
             : root.trackColor
-          anchors.left: parent.left
-          anchors.verticalCenter: parent.verticalCenter
 
           Text {
             anchors.centerIn: parent
-            text: root.shortLabel
-            color: root.recording ? root.okColor : root.foreground
+            text: root.inMeeting ? "●" : (root.pending.length ? String(root.pending.length) : "⌁")
+            color: root.inMeeting ? root.okColor : root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.title
             font.bold: true
@@ -279,43 +284,15 @@ Panel {
           anchors.verticalCenter: parent.verticalCenter
           spacing: Style.space(3)
 
-          Row {
-            spacing: Style.space(8)
+          Text {
             width: parent.width
-
-            Text {
-              text: root.ready ? root.label : "Screenpipe"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.title
-              font.bold: true
-              elide: Text.ElideRight
-              width: Math.min(implicitWidth, parent.width - statePill.width - Style.space(8))
-            }
-
-            Rectangle {
-              id: statePill
-              anchors.verticalCenter: parent.verticalCenter
-              width: stateTxt.implicitWidth + Style.space(12)
-              height: Style.space(20)
-              radius: height / 2
-              color: root.recording
-                ? Qt.rgba(root.okColor.r, root.okColor.g, root.okColor.b, 0.18)
-                : root.surfaceLift
-
-              Text {
-                id: stateTxt
-                anchors.centerIn: parent
-                text: root.stateWord
-                color: root.stateColor
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                font.letterSpacing: 0.6
-              }
-            }
+            text: root.heroTitle
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+            font.bold: true
+            elide: Text.ElideRight
           }
-
           Text {
             width: parent.width
             text: root.heroMeta
@@ -323,6 +300,7 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             elide: Text.ElideRight
+            wrapMode: Text.NoWrap
           }
         }
 
@@ -337,111 +315,16 @@ Panel {
         }
       }
 
-      // Hairline
-      Rectangle {
-        width: parent.width
-        height: 1
-        color: root.trackColor
-      }
+      Rectangle { width: parent.width; height: 1; color: root.trackColor }
 
-      // Mode control — Auto follows window routes; Pinned locks current bucket
-      Row {
-        width: parent.width
-        height: Style.space(36)
-        spacing: Style.space(6)
-
-        // Auto
-        Rectangle {
-          width: (parent.width - parent.spacing) / 2
-          height: parent.height
-          radius: Style.cornerRadius
-          color: root.mode === "auto"
-            ? Util.alpha(root.okColor, 0.16)
-            : root.surfaceLift
-          border.width: 1
-          border.color: root.mode === "auto"
-            ? Util.alpha(root.okColor, 0.45)
-            : root.trackColor
-
-          Column {
-            anchors.centerIn: parent
-            spacing: Style.space(1)
-            Text {
-              anchors.horizontalCenter: parent.horizontalCenter
-              text: "Auto"
-              color: root.mode === "auto" ? root.okColor : root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              font.bold: true
-            }
-            Text {
-              anchors.horizontalCenter: parent.horizontalCenter
-              text: "follow apps"
-              color: root.dimColor
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
-
-          MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: root.runAction("clear")
-          }
-        }
-
-        // Pinned
-        Rectangle {
-          width: (parent.width - parent.spacing) / 2
-          height: parent.height
-          radius: Style.cornerRadius
-          color: root.mode === "manual"
-            ? Util.alpha(root.foreground, 0.12)
-            : root.surfaceLift
-          border.width: 1
-          border.color: root.mode === "manual"
-            ? Util.alpha(root.foreground, 0.28)
-            : root.trackColor
-
-          Column {
-            anchors.centerIn: parent
-            spacing: Style.space(1)
-            Text {
-              anchors.horizontalCenter: parent.horizontalCenter
-              text: "Pinned"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              font.bold: true
-            }
-            Text {
-              anchors.horizontalCenter: parent.horizontalCenter
-              text: root.mode === "manual" ? ("hold " + root.shortLabel) : "lock current"
-              color: root.dimColor
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
-
-          MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: {
-              // Pin whatever is showing now (active / desired bucket)
-              if (root.org && root.org.length)
-                root.runAction(root.org)
-            }
-          }
-        }
-      }
-
-      // Storage destinations (buckets)
+      // Unfiled meetings
       Column {
         width: parent.width
-        spacing: Style.space(4)
+        spacing: Style.space(6)
+        visible: root.pending.length > 0 || root.inMeeting
 
         Text {
-          text: "RECORDING STORAGE"
+          text: root.inMeeting ? "IN PROGRESS" : "UNFILED"
           color: root.faintColor
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -449,51 +332,116 @@ Panel {
           font.letterSpacing: 1.4
         }
 
+        Text {
+          visible: root.inMeeting
+          width: parent.width
+          wrapMode: Text.WordWrap
+          text: "Stays in the inbox until the call ends. Then pick a destination to file it."
+          color: root.dimColor
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
         Repeater {
-          model: root.orgs
-          delegate: Item {
-            id: row
+          model: root.pending
+          delegate: Rectangle {
             required property var modelData
             required property int index
             width: parent.width
-            height: Style.space(64)
-            readonly property bool selected: modelData.selected === true
-            readonly property bool live: modelData.recording === true
-            readonly property bool hot: root.hoveredBucket === index
-            readonly property bool picking: root.pickingOrg === modelData.id
+            height: Style.space(44)
+            radius: Style.cornerRadius
+            color: root.selectedPending === index
+              ? Util.alpha(root.foreground, 0.10)
+              : root.surfaceLift
+            border.width: root.selectedPending === index ? 1 : 0
+            border.color: Util.alpha(root.foreground, 0.22)
+
+            Column {
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.margins: Style.space(12)
+              spacing: Style.space(2)
+
+              Text {
+                width: parent.width
+                text: modelData.label
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+                elide: Text.ElideRight
+              }
+              Text {
+                width: parent.width
+                text: modelData.app
+                  + (modelData.suggest_label ? "  ·  suggest " + modelData.suggest_label : "")
+                color: root.dimColor
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+            }
+
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.selectedPending = index
+            }
+          }
+        }
+      }
+
+      // Destinations — click to file selected unfiled meeting (instant; no recorder restart)
+      Column {
+        width: parent.width
+        spacing: Style.space(6)
+
+        Text {
+          text: "FILE TO"
+          color: root.faintColor
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+          font.letterSpacing: 1.4
+        }
+
+        Text {
+          visible: !root.selectedMeeting && !root.inMeeting
+          width: parent.width
+          text: "Nothing to file. Inbox keeps capturing quietly."
+          color: root.dimColor
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+
+        Repeater {
+          model: root.destinations
+          delegate: Item {
+            id: dest
+            required property var modelData
+            required property int index
+            width: parent.width
+            height: Style.space(52)
+            readonly property bool hot: root.hoveredDest === index
+            readonly property bool canFile: !!root.selectedMeeting && !root.filing
 
             Rectangle {
               anchors.fill: parent
               radius: Style.cornerRadius
-              color: {
-                if (row.live) return Qt.rgba(root.okColor.r, root.okColor.g, root.okColor.b, 0.10)
-                if (row.selected) return Util.alpha(root.foreground, 0.08)
-                if (row.hot) return Util.alpha(root.foreground, 0.05)
-                return "transparent"
-              }
-              border.width: row.selected || row.live ? 1 : 0
-              border.color: row.live
-                ? Qt.rgba(root.okColor.r, root.okColor.g, root.okColor.b, 0.35)
-                : Util.alpha(root.foreground, 0.14)
-
-              Behavior on color { ColorAnimation { duration: 90 } }
-            }
-
-            Rectangle {
-              visible: row.selected || row.live
-              width: Style.space(3)
-              height: parent.height - Style.space(14)
-              radius: width / 2
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(6)
-              anchors.verticalCenter: parent.verticalCenter
-              color: row.live ? root.okColor : root.faintColor
+              color: dest.hot && dest.canFile
+                ? Util.alpha(root.okColor, 0.12)
+                : root.surfaceLift
+              border.width: 1
+              border.color: dest.hot && dest.canFile
+                ? Util.alpha(root.okColor, 0.4)
+                : root.trackColor
             }
 
             Row {
               anchors.fill: parent
-              anchors.leftMargin: Style.space(18)
-              anchors.rightMargin: Style.space(10)
+              anchors.margins: Style.space(12)
               spacing: Style.space(10)
 
               Rectangle {
@@ -501,14 +449,11 @@ Panel {
                 height: width
                 radius: width / 2
                 anchors.verticalCenter: parent.verticalCenter
-                color: row.live
-                  ? Qt.rgba(root.okColor.r, root.okColor.g, root.okColor.b, 0.20)
-                  : root.surfaceLift
-
+                color: Util.alpha(root.foreground, 0.08)
                 Text {
                   anchors.centerIn: parent
-                  text: String(modelData.short || modelData.label || "?").slice(0, 2)
-                  color: row.live ? root.okColor : root.dimColor
+                  text: String(modelData.short || "?").slice(0, 2)
+                  color: root.dimColor
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   font.bold: true
@@ -516,56 +461,36 @@ Panel {
               }
 
               Column {
-                width: parent.width - Style.space(28) - Style.space(10) - Style.space(64)
+                width: parent.width - Style.space(28) - Style.space(10) - Style.space(40)
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(2)
-
-                Row {
-                  width: parent.width
-                  spacing: Style.space(8)
-
-                  Text {
-                    text: modelData.label
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    font.bold: true
-                    elide: Text.ElideRight
-                    width: Math.min(implicitWidth, parent.width - sizeTxt.implicitWidth - Style.space(8))
-                  }
-
-                  Text {
-                    id: sizeTxt
-                    text: String(modelData.size_human || "")
-                    color: root.dimColor
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-                }
-
                 Text {
                   width: parent.width
-                  text: row.picking
-                    ? "pick a folder…"
-                    : String(modelData.dir_short || modelData.dir || "no folder set")
-                  color: row.live ? root.okColor : root.dimColor
+                  text: modelData.label
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                  elide: Text.ElideRight
+                }
+                Text {
+                  width: parent.width
+                  text: (modelData.size_human || "") + "  ·  " + (modelData.dir_short || "")
+                  color: root.dimColor
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   elide: Text.ElideMiddle
                 }
               }
 
-              // Folder button — change storage path
               Rectangle {
                 width: Style.space(34)
                 height: Style.space(28)
                 radius: Style.cornerRadius
                 anchors.verticalCenter: parent.verticalCenter
-                color: root.surfaceLift
+                color: Util.alpha(root.foreground, 0.06)
                 border.width: 1
                 border.color: root.trackColor
-
                 Text {
                   anchors.centerIn: parent
                   text: "Dir"
@@ -574,140 +499,35 @@ Panel {
                   font.pixelSize: Style.font.caption
                   font.bold: true
                 }
-
                 MouseArea {
                   anchors.fill: parent
                   cursorShape: Qt.PointingHandCursor
                   onClicked: root.pickDir(modelData.id)
                 }
               }
-
-              // Radio / live mark
-              Item {
-                width: Style.space(18)
-                height: width
-                anchors.verticalCenter: parent.verticalCenter
-
-                Rectangle {
-                  anchors.fill: parent
-                  radius: width / 2
-                  color: "transparent"
-                  border.width: 1.5
-                  border.color: row.live || row.selected ? root.okColor : root.faintColor
-
-                  Rectangle {
-                    visible: row.selected || row.live
-                    anchors.centerIn: parent
-                    width: parent.width * 0.45
-                    height: width
-                    radius: width / 2
-                    color: row.live ? root.okColor : root.foreground
-                  }
-                }
-              }
             }
 
-              MouseArea {
+            MouseArea {
               anchors.fill: parent
-              anchors.rightMargin: Style.space(48)
+              anchors.rightMargin: Style.space(44)
               hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onEntered: root.hoveredBucket = index
-              onExited: if (root.hoveredBucket === index) root.hoveredBucket = -1
-              onClicked: root.runAction(modelData.id)
-              onPressAndHold: {
-                var p = modelData.dir || ""
-                if (p) root.openDir(p)
-              }
+              enabled: dest.canFile
+              cursorShape: dest.canFile ? Qt.PointingHandCursor : Qt.ArrowCursor
+              onEntered: root.hoveredDest = index
+              onExited: if (root.hoveredDest === index) root.hoveredDest = -1
+              onClicked: root.fileTo(modelData.id)
             }
           }
         }
       }
 
-      // Agent footer
-      Rectangle {
+      Text {
         width: parent.width
-        height: agentInner.implicitHeight + Style.space(20)
-        radius: Style.cornerRadius
-        color: root.surfaceLift
-
-        Column {
-          id: agentInner
-          anchors.left: parent.left
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          anchors.margins: Style.space(12)
-          spacing: Style.space(4)
-
-          Row {
-            width: parent.width
-            spacing: Style.space(8)
-
-            Text {
-              text: "AGENT"
-              color: root.faintColor
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              font.letterSpacing: 1.4
-              anchors.verticalCenter: parent.verticalCenter
-            }
-
-            Item { width: 1; height: 1 }
-
-            Text {
-              visible: root.ready
-              text: root.agentShare ? "opt-in" : "off"
-              color: root.agentShare ? root.okColor : root.faintColor
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              anchors.verticalCenter: parent.verticalCenter
-            }
-          }
-
-          Text {
-            width: parent.width
-            wrapMode: Text.WordWrap
-            text: root.agentShare
-              ? (root.agentLabel || "Agent") + (root.apiUrl ? "  ·  " + root.apiUrl : "")
-              : (root.agentNote || "This bucket never leaves the machine.")
-            color: root.dimColor
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          Row {
-            spacing: Style.space(14)
-            topPadding: Style.space(4)
-
-            Text {
-              text: "Routes"
-              color: root.okColor
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.openRoutes()
-              }
-            }
-
-            Text {
-              text: "Agent map"
-              color: root.okColor
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.openAgentTargets()
-              }
-            }
-          }
-        }
+        visible: root.filing
+        text: "Exporting into that folder…"
+        color: root.okColor
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
       }
     }
   }
