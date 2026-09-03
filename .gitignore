@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.demo/
+# never ship user config
+orgs.toml
+org-routes.toml
+agent-targets.json
+hermes-targets.json
+active.json
+override.json

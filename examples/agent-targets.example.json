@@ -1,0 +1,20 @@
+{
+  "work": {
+    "label": "Work agent",
+    "api_url": "http://127.0.0.1:3030",
+    "note": "Local only by default.",
+    "share": false
+  },
+  "client": {
+    "label": "Client agent",
+    "api_url": "http://127.0.0.1:3031",
+    "note": "Opt-in: point your remote agent at this URL (e.g. via Tailscale).",
+    "share": true
+  },
+  "personal": {
+    "label": "Personal",
+    "api_url": null,
+    "note": "Never shared.",
+    "share": false
+  }
+}

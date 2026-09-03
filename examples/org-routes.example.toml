@@ -1,0 +1,21 @@
+# Example window → bucket routing. Copy to ~/.config/screenpipe/org-routes.toml.
+# Keys under [apps]/[slack]/[meet] must match org ids from orgs.toml.
+
+default = "personal"
+slack_default = "client"
+
+[apps]
+# org-id = list of window class/title substrings (case-insensitive)
+work = ["Microsoft Teams", "teams.microsoft.com"]
+personal = ["Discord", "discord.com"]
+
+[slack]
+# Match Slack workspace name as it appears in the window title
+# ("channel - Workspace Name - Slack")
+work = ["My Work Workspace"]
+
+[meet]
+# Optional: Google Meet URL fragments per bucket
+work = []
+client = []
+personal = []
