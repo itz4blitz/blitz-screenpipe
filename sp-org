@@ -277,6 +277,114 @@ def health_ok(port: int) -> bool:
         return False
 
 
+def dir_size_bytes(path: str) -> int:
+    root = Path(path)
+    if not root.exists():
+        return 0
+    total = 0
+    try:
+        for p in root.rglob("*"):
+            try:
+                if p.is_file() and not p.is_symlink():
+                    total += p.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return total
+
+
+def human_bytes(n: int) -> str:
+    x = float(n)
+    for unit in ("B", "K", "M", "G", "T"):
+        if x < 1024 or unit == "T":
+            if unit == "B":
+                return f"{int(x)}B"
+            return f"{x:.0f}{unit}" if x >= 10 or unit == "K" else f"{x:.1f}{unit}"
+        x /= 1024
+    return f"{n}B"
+
+
+def shorten_path(path: str) -> str:
+    home = str(HOME)
+    if path.startswith(home + "/") or path == home:
+        return "~" + path[len(home) :]
+    return path
+
+
+def storage_info(path: str) -> dict:
+    p = Path(path)
+    size = dir_size_bytes(path) if p.exists() else 0
+    return {
+        "dir": path,
+        "dir_short": shorten_path(path),
+        "exists": p.exists(),
+        "size_bytes": size,
+        "size_human": human_bytes(size),
+    }
+
+
+def set_org_data_dir(org_id: str, new_dir: str) -> None:
+    """Update data_dir in orgs.toml for org_id (preserves the rest of the file)."""
+    if not ORGS_PATH.exists():
+        raise SystemExit(f"missing {ORGS_PATH}")
+    abs_dir = expand_path(new_dir)
+    Path(abs_dir).mkdir(parents=True, exist_ok=True)
+    # Prefer ~ form in the config file when under $HOME
+    home = str(HOME)
+    stored = ("~" + abs_dir[len(home) :]) if abs_dir.startswith(home) else abs_dir
+    text = ORGS_PATH.read_text()
+    section = f"[orgs.{org_id}]"
+    if section not in text:
+        raise SystemExit(f"no {section} in {ORGS_PATH}")
+    parts = text.split(section, 1)
+    head, rest = parts[0], parts[1]
+    # next section starts at next [orgs. or end
+    m = re.search(r"\n\[orgs\.", rest)
+    if m:
+        body, tail = rest[: m.start()], rest[m.start() :]
+    else:
+        body, tail = rest, ""
+    if re.search(r"(?m)^\s*data_dir\s*=", body):
+        body = re.sub(
+            r'(?m)^(\s*data_dir\s*=\s*)"[^"]*"',
+            rf'\1"{stored}"',
+            body,
+            count=1,
+        )
+    else:
+        body = body.rstrip() + f'\ndata_dir = "{stored}"\n'
+    ORGS_PATH.write_text(head + section + body + tail)
+
+
+def write_one_unit(org_id: str, meta: dict) -> Path:
+    native = HOME / ".local/bin/screenpipe-native"
+    unit_dir = HOME / ".config/systemd/user"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    path = unit_dir / meta["unit"]
+    body = f"""[Unit]
+Description=Screenpipe recorder ({meta['label']})
+After=default.target
+
+[Service]
+Type=simple
+ExecStart={native} record \\
+  --data-dir {meta['dir']} \\
+  --port {meta['port']} \\
+  --language english \\
+  --use-pii-removal true
+Restart=on-failure
+RestartSec=5
+Environment=HOME={HOME}
+Environment=PATH={HOME}/.local/bin:{HOME}/.local/share/mise/shims:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
+"""
+    path.write_text(body)
+    return path
+
+
 def build_status() -> dict:
     orgs = load_orgs()
     if not orgs:
@@ -322,13 +430,18 @@ def build_status() -> dict:
     org_rows = []
     for key, o in orgs.items():
         a = agents.get(key, {})
+        store = storage_info(o["dir"])
         org_rows.append(
             {
                 "id": key,
                 "label": o["label"],
                 "short": o["short"],
                 "port": o["port"],
-                "dir": o["dir"],
+                "dir": store["dir"],
+                "dir_short": store["dir_short"],
+                "exists": store["exists"],
+                "size_bytes": store["size_bytes"],
+                "size_human": store["size_human"],
                 "unit_active": unit_active(o["unit"]),
                 "health": health_ok(o["port"]) if unit_active(o["unit"]) else False,
                 "selected": key == desired,
@@ -342,6 +455,7 @@ def build_status() -> dict:
 
     share = bool(meta.get("agent_share")) or bool(agent.get("share"))
     api = agent.get("api_url") or (f"http://127.0.0.1:{meta['port']}" if meta["port"] else "")
+    active_store = storage_info(meta["dir"])
 
     return {
         "ready": True,
@@ -355,6 +469,9 @@ def build_status() -> dict:
         "label": meta["label"],
         "short": meta["short"],
         "port": meta["port"],
+        "dir": active_store["dir"],
+        "dir_short": active_store["dir_short"],
+        "size_human": active_store["size_human"],
         "api_url": api,
         "agent_share": share and bool(api),
         "hermes_share": share and bool(api),  # legacy
@@ -425,6 +542,7 @@ def cmd_status(as_json: bool) -> int:
         return 1
     print(f"mode={st['mode']}  paused={st['paused']}  recording={st['recording']}")
     print(f"org={st['org']} ({st['label']})  reason={st['reason']}  api={st['api_url']}")
+    print(f"storage={st.get('dir_short')}  ({st.get('size_human')})")
     if st.get("override"):
         print(f"override={st['override']} (sp-org clear to return to auto)")
     agent = st.get("agent") or {}
@@ -433,7 +551,7 @@ def cmd_status(as_json: bool) -> int:
     for o in st["orgs"]:
         mark = "*" if o["selected"] else " "
         rec = "REC" if o["recording"] else ("on " if o["unit_active"] else "   ")
-        print(f" {mark} {o['id']:<12} {rec}  :{o['port']}  {o['label']}")
+        print(f" {mark} {o['id']:<12} {rec}  :{o['port']}  {o['size_human']:>5}  {o['dir_short']}  {o['label']}")
     return 0
 
 
@@ -540,35 +658,56 @@ def cmd_write_units() -> int:
     if not orgs:
         print(f"missing {ORGS_PATH}", file=sys.stderr)
         return 1
-    native = HOME / ".local/bin/screenpipe-native"
-    unit_dir = HOME / ".config/systemd/user"
-    unit_dir.mkdir(parents=True, exist_ok=True)
     for org_id, meta in orgs.items():
-        path = unit_dir / meta["unit"]
-        body = f"""[Unit]
-Description=Screenpipe recorder ({meta['label']})
-After=default.target
-
-[Service]
-Type=simple
-ExecStart={native} record \\
-  --data-dir {meta['dir']} \\
-  --port {meta['port']} \\
-  --language english \\
-  --use-pii-removal true
-Restart=on-failure
-RestartSec=5
-Environment=HOME={HOME}
-Environment=PATH={HOME}/.local/bin:{HOME}/.local/share/mise/shims:/usr/bin:/bin
-
-[Install]
-WantedBy=default.target
-"""
-        path.write_text(body)
+        path = write_one_unit(org_id, meta)
         print(f"wrote {path}")
     _run(["systemctl", "--user", "daemon-reload"])
     print("daemon-reloaded")
     return 0
+
+
+def cmd_set_dir(org_id: str, new_dir: str, *, as_json: bool = False) -> int:
+    orgs = load_orgs()
+    if org_id not in orgs:
+        print(f"unknown org: {org_id}", file=sys.stderr)
+        return 1
+    was_active = unit_active(orgs[org_id]["unit"])
+    set_org_data_dir(org_id, new_dir)
+    orgs = load_orgs()
+    write_one_unit(org_id, orgs[org_id])
+    _run(["systemctl", "--user", "daemon-reload"])
+    if was_active:
+        # Retarget live recorder onto the new folder
+        start_org(orgs, org_id)
+    st = build_status()
+    if as_json or "--json" in sys.argv:
+        print(json.dumps(st))
+    else:
+        print(f"{org_id} → {st['orgs'] and next(o['dir_short'] for o in st['orgs'] if o['id']==org_id)}")
+    return 0
+
+
+def cmd_pick_dir(org_id: str) -> int:
+    orgs = load_orgs()
+    if org_id not in orgs:
+        print(f"unknown org: {org_id}", file=sys.stderr)
+        return 1
+    current = orgs[org_id]["dir"]
+    r = _run(
+        [
+            "zenity",
+            "--file-selection",
+            "--directory",
+            f"--title=Recording folder for {orgs[org_id]['label']}",
+            f"--filename={current}/",
+        ],
+        timeout=600,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        # cancelled — still emit status for the panel
+        print(json.dumps(build_status()))
+        return 0
+    return cmd_set_dir(org_id, r.stdout.strip(), as_json=True)
 
 
 def usage(orgs: dict) -> int:
@@ -576,11 +715,13 @@ def usage(orgs: dict) -> int:
     print(
         f"""Usage: sp-org <command>
 
-  status [--json]     Show buckets / recording / agent target
+  status [--json]     Show buckets / storage / agent target
   {ids}
                       Switch bucket (sets manual override)
   clear               Drop override, return to auto
   pause|resume        Stop / start recording for current bucket
+  set-dir <id> <path> Point a bucket at a folder (rewrites unit; restarts if live)
+  pick-dir <id>       Zenity folder picker → set-dir
   auto                One auto-reconcile tick
   watch               Loop auto ticks every 3s
   agent               Print agent share target for active bucket
@@ -628,6 +769,16 @@ def main(argv: list[str]) -> int:
         return cmd_agent()
     if cmd == "write-units":
         return cmd_write_units()
+    if cmd == "set-dir":
+        if len(argv) < 4:
+            print("usage: sp-org set-dir <org-id> <path>", file=sys.stderr)
+            return 1
+        return cmd_set_dir(argv[2], argv[3], as_json=as_json)
+    if cmd == "pick-dir":
+        if len(argv) < 3:
+            print("usage: sp-org pick-dir <org-id>", file=sys.stderr)
+            return 1
+        return cmd_pick_dir(argv[2])
     if cmd == "paths":
         print(f"orgs={ORGS_PATH}")
         print(f"routes={ROUTES_PATH}")

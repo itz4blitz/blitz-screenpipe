@@ -42,6 +42,15 @@ sp-org clear   # pick bucket from your routes
 { "id": "blitz.screenpipe" }
 ```
 
+## Storage
+
+Each bucket has its own on-disk folder (`data_dir` in `orgs.toml`). The bar shows path + size. Click the folder icon to retarget a bucket; if that bucket is live, the recorder restarts into the new folder.
+
+```bash
+sp-org set-dir work /mnt/storage/screenpipe/work
+sp-org pick-dir client
+```
+
 ## CLI
 
 ```text

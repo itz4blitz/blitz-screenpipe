@@ -24,8 +24,11 @@ Panel {
   property string agentLabel: ""
   property string agentNote: ""
   property string hint: ""
+  property string dirShort: ""
+  property string sizeHuman: ""
   property var orgs: []
   property int hoveredBucket: -1
+  property string pickingOrg: ""
 
   // Popup surface colors (not bar colors) — readable on the card
   readonly property color foreground: Color.popups.text
@@ -50,8 +53,9 @@ Panel {
 
   readonly property string heroMeta: {
     if (!root.ready) return root.hint !== "" ? root.hint : "not configured"
-    var bits = [root.mode === "auto" ? "auto routing" : "pinned"]
-    if (root.reason) bits.push(root.reason.replace(/^focus:/, "").replace(/^app:/, ""))
+    var bits = []
+    if (root.dirShort) bits.push(root.dirShort + (root.sizeHuman ? "  ·  " + root.sizeHuman : ""))
+    bits.push(root.mode === "auto" ? "auto" : "pinned")
     return bits.join("  ·  ")
   }
 
@@ -78,10 +82,19 @@ Panel {
     agentLabel = String(h.label || "")
     agentNote = String(h.note || "")
     hint = String(d.hint || "")
+    dirShort = String(d.dir_short || d.dir || "")
+    sizeHuman = String(d.size_human || "")
     orgs = Array.isArray(d.orgs) ? d.orgs : []
+    // DEMO mode auto-opens once for README shots. Do NOT bind the panel's
+    // `open` to demoLock — KeyboardPanel is a fullscreen overlay, and that
+    // OR would make outside-click / Escape unable to dismiss it.
     if (d.demo) {
-      demoLock = true
-      if (!root.opened) root.open()
+      if (!demoLock) {
+        demoLock = true
+        if (!root.opened) root.open()
+      }
+    } else if (demoLock) {
+      demoLock = false
     }
   }
 
@@ -93,6 +106,18 @@ Panel {
     if (actionProc.running) return
     actionProc.command = ["python3", root.collectorPath, "action", name]
     actionProc.running = true
+  }
+
+  function pickDir(orgId) {
+    if (actionProc.running || !orgId) return
+    pickingOrg = orgId
+    actionProc.command = ["python3", root.collectorPath, "action", "pick-dir", orgId]
+    actionProc.running = true
+  }
+
+  function openDir(path) {
+    if (!root.bar || !path) return
+    root.bar.run("bash -lc 'xdg-open " + JSON.stringify(path) + "'")
   }
 
   function openRoutes() {
@@ -126,7 +151,13 @@ Panel {
 
   Process {
     id: actionProc
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.apply(text) }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.pickingOrg = ""
+        root.apply(text)
+      }
+    }
   }
 
   Timer {
@@ -192,16 +223,16 @@ Panel {
     anchorItem: button
     owner: root
     bar: root.bar
-    open: root.opened || root.demoLock
+    open: root.opened
     contentWidth: panel.fittedContentWidth(Style.space(380))
     contentHeight: panel.fittedContentHeight(
       Style.space(56)           // hero
       + Style.space(16) + 1     // gap + hairline
       + Style.space(16) + Style.space(34)  // gap + segment
-      + Style.space(16) + Style.space(18) + (root.orgs.length * Style.space(56))  // buckets
+      + Style.space(16) + Style.space(18) + (root.orgs.length * Style.space(68))  // storage rows
       + Style.space(16) + Style.space(88)  // agent footer
       + Style.space(24),
-      Style.space(720)
+      Style.space(760)
     )
 
     Column {
@@ -373,13 +404,13 @@ Panel {
         }
       }
 
-      // Buckets
+      // Storage destinations (buckets)
       Column {
         width: parent.width
         spacing: Style.space(4)
 
         Text {
-          text: "BUCKET"
+          text: "RECORDING STORAGE"
           color: root.faintColor
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -394,10 +425,11 @@ Panel {
             required property var modelData
             required property int index
             width: parent.width
-            height: Style.space(52)
+            height: Style.space(64)
             readonly property bool selected: modelData.selected === true
             readonly property bool live: modelData.recording === true
             readonly property bool hot: root.hoveredBucket === index
+            readonly property bool picking: root.pickingOrg === modelData.id
 
             Rectangle {
               anchors.fill: parent
@@ -416,7 +448,6 @@ Panel {
               Behavior on color { ColorAnimation { duration: 90 } }
             }
 
-            // Left accent bar when live/selected
             Rectangle {
               visible: row.selected || row.live
               width: Style.space(3)
@@ -431,10 +462,9 @@ Panel {
             Row {
               anchors.fill: parent
               anchors.leftMargin: Style.space(18)
-              anchors.rightMargin: Style.space(14)
-              spacing: Style.space(12)
+              anchors.rightMargin: Style.space(10)
+              spacing: Style.space(10)
 
-              // Initials disc
               Rectangle {
                 width: Style.space(28)
                 height: width
@@ -455,28 +485,53 @@ Panel {
               }
 
               Column {
-                width: parent.width - Style.space(28) - Style.space(12) - Style.space(36)
+                width: parent.width - Style.space(28) - Style.space(10) - Style.space(64)
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(2)
 
-                Text {
+                Row {
                   width: parent.width
-                  text: modelData.label
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
-                  font.bold: true
-                  elide: Text.ElideRight
+                  spacing: Style.space(8)
+
+                  Text {
+                    text: modelData.label
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: true
+                    elide: Text.ElideRight
+                    width: Math.min(implicitWidth, parent.width - sizeTxt.implicitWidth - Style.space(8))
+                  }
+
+                  Text {
+                    id: sizeTxt
+                    text: String(modelData.size_human || "")
+                    color: root.dimColor
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
                 }
 
                 Text {
                   width: parent.width
-                  text: root.bucketShares(modelData) ? "shares with agent" : "stays on this machine"
-                  color: root.dimColor
+                  text: row.picking
+                    ? "pick a folder…"
+                    : String(modelData.dir_short || modelData.dir || "no folder set")
+                  color: row.live ? root.okColor : root.dimColor
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
+                  elide: Text.ElideMiddle
                 }
+              }
+
+              // Folder button — change storage path
+              PanelActionButton {
+                anchors.verticalCenter: parent.verticalCenter
+                iconText: "󰉋"
+                tooltipText: "Change recording folder"
+                foreground: root.foreground
+                onClicked: root.pickDir(modelData.id)
               }
 
               // Radio / live mark
@@ -506,11 +561,16 @@ Panel {
 
             MouseArea {
               anchors.fill: parent
+              anchors.rightMargin: Style.space(56)
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
               onEntered: root.hoveredBucket = index
               onExited: if (root.hoveredBucket === index) root.hoveredBucket = -1
               onClicked: root.runAction(modelData.id)
+              onPressAndHold: {
+                var p = modelData.dir || ""
+                if (p) root.openDir(p)
+              }
             }
           }
         }

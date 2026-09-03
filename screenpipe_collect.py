@@ -50,6 +50,11 @@ def demo_payload(view: str = "default") -> dict:
             "label": "Work",
             "short": "Wrk",
             "port": 3030,
+            "dir": "/home/user/.local/share/screenpipe/work",
+            "dir_short": "~/.local/share/screenpipe/work",
+            "exists": True,
+            "size_bytes": 1288490188,
+            "size_human": "1.2G",
             "selected": active == "work",
             "recording": False,
             "unit_active": False,
@@ -63,6 +68,11 @@ def demo_payload(view: str = "default") -> dict:
             "label": "Client",
             "short": "Cli",
             "port": 3031,
+            "dir": "/mnt/storage/screenpipe/client",
+            "dir_short": "/mnt/storage/screenpipe/client",
+            "exists": True,
+            "size_bytes": 482344960,
+            "size_human": "460M",
             "selected": active == "client",
             "recording": recording and active == "client",
             "unit_active": recording and active == "client",
@@ -81,6 +91,11 @@ def demo_payload(view: str = "default") -> dict:
             "label": "Personal",
             "short": "Me",
             "port": 3032,
+            "dir": "/home/user/.local/share/screenpipe/personal",
+            "dir_short": "~/.local/share/screenpipe/personal",
+            "exists": True,
+            "size_bytes": 89128960,
+            "size_human": "85M",
             "selected": active == "personal",
             "recording": False,
             "unit_active": paused,
@@ -106,6 +121,9 @@ def demo_payload(view: str = "default") -> dict:
         "label": active_org["label"],
         "short": active_org["short"],
         "port": active_org["port"],
+        "dir": active_org["dir"],
+        "dir_short": active_org["dir_short"],
+        "size_human": active_org["size_human"],
         "api_url": agent.get("api_url") or f"http://127.0.0.1:{active_org['port']}",
         "agent_share": bool(agent.get("share")),
         "hermes_share": bool(agent.get("share")),
@@ -150,13 +168,40 @@ def main(argv: list[str]) -> int:
     action = argv[1]
     if action == "action":
         if demo_view():
-            # In DEMO mode, ignore mutations and re-emit demo payload
             print(json.dumps(demo_payload(demo_view())))
             return 0
         if len(argv) < 3:
             print(json.dumps({"ok": False, "error": "missing action"}))
             return 1
         sub = argv[2]
+        # pick-dir <org>  |  set-dir <org> <path>  |  plain verbs / org ids
+        if sub == "pick-dir":
+            if len(argv) < 4:
+                print(json.dumps({"ok": False, "error": "pick-dir needs org id"}))
+                return 1
+            r = sp("pick-dir", argv[3])
+            out = r.stdout.strip() or "{}"
+            try:
+                st = json.loads(out)
+            except json.JSONDecodeError:
+                st = status_json()
+            st["ok"] = r.returncode == 0
+            print(json.dumps(st))
+            return 0 if r.returncode == 0 else 1
+        if sub == "set-dir":
+            if len(argv) < 5:
+                print(json.dumps({"ok": False, "error": "set-dir needs org id and path"}))
+                return 1
+            r = sp("set-dir", argv[3], argv[4], "--json")
+            out = r.stdout.strip() or "{}"
+            try:
+                st = json.loads(out)
+            except json.JSONDecodeError:
+                st = status_json()
+            st["ok"] = r.returncode == 0
+            print(json.dumps(st))
+            return 0 if r.returncode == 0 else 1
+
         r = sp(sub)
         st = status_json()
         st["ok"] = r.returncode == 0
